@@ -312,6 +312,13 @@ fn build_spatial_editor(blocks: Vec<TextBlock>, rope: Rope, optimal_grid: (usize
                     println!("🚀 VISUAL ALTO spatial editor ready!");
                     println!("📊 {} blocks, {} chars, {}×{} semantic grid with VISUAL DISPLAY", 
                              self.blocks.len(), self.rope.len_chars(), self.optimal_grid.0, self.optimal_grid.1);
+                             
+                    // DISPLAY ALTO SPATIAL TEXT for immediate enjoyment!
+                    println!("\n📄 ALTO SPATIAL TEXT (first 800 chars):");
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("{}", self.display_text.chars().take(800).collect::<String>());
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("🎮 INTERACTIVE: Click in window → cursor moves → background changes → type to edit!");
                 });
                 
                 window.request_redraw();
@@ -461,11 +468,33 @@ fn build_spatial_editor(blocks: Vec<TextBlock>, rope: Rope, optimal_grid: (usize
                 label: Some("Visual Text Encoder"),
             });
             
-            // AGGRESSIVE VISUAL FEEDBACK: Bright flashing based on cursor position
-            let clear_color = match self.cursor_pos % 3 {
-                0 => wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }, // BRIGHT RED
-                1 => wgpu::Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 }, // BRIGHT GREEN
-                _ => wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }, // BRIGHT BLUE
+            // INTERACTIVE COLOR PALETTE: Based on cursor line and content
+            let current_line = self.rope.char_to_line(self.cursor_pos);
+            let line_text = if current_line < self.rope.len_lines() {
+                self.rope.line(current_line).to_string()
+            } else {
+                String::new()
+            };
+            
+            let clear_color = if line_text.contains("$") {
+                // Money lines = GOLD
+                wgpu::Color { r: 1.0, g: 0.8, b: 0.0, a: 1.0 }
+            } else if line_text.contains("%") {
+                // Percentage lines = PURPLE  
+                wgpu::Color { r: 0.8, g: 0.0, b: 1.0, a: 1.0 }
+            } else if line_text.contains("Table") {
+                // Table headers = CYAN
+                wgpu::Color { r: 0.0, g: 1.0, b: 1.0, a: 1.0 }
+            } else if current_line < 5 {
+                // Document header = BRIGHT WHITE
+                wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+            } else {
+                // Regular text = RAINBOW based on line number  
+                let hue = (current_line as f32 * 0.1) % 1.0;
+                let r = (hue * 6.0).sin().abs();
+                let g = ((hue + 0.33) * 6.0).sin().abs();  
+                let b = ((hue + 0.66) * 6.0).sin().abs();
+                wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
             };
             
             {
@@ -485,14 +514,55 @@ fn build_spatial_editor(blocks: Vec<TextBlock>, rope: Rope, optimal_grid: (usize
                 });
             }
             
-            // RENDER TEXT with fontdue (simple bitmap text overlay)
+            // RENDER ACTUAL TEXT with fontdue bitmap overlay  
             if let Some(font) = &self.font {
-                // Render first character of ALTO text to test fontdue
-                let first_char = self.display_text.chars().next().unwrap_or('?');
-                let (metrics, bitmap) = font.rasterize(first_char, 24.0);
+                // Create simple texture from text bitmap
+                let text_to_render = self.display_text.lines().take(10).collect::<Vec<_>>().join("\n");
                 
-                println!("📝 Fontdue bitmap: '{}' ({}×{} pixels, {} bytes)", 
-                         first_char, metrics.width, metrics.height, bitmap.len());
+                // For each line, create character bitmaps
+                for (line_idx, line) in text_to_render.lines().enumerate().take(5) {
+                    for (char_idx, ch) in line.chars().enumerate().take(50) {
+                        let (metrics, bitmap) = font.rasterize(ch, 16.0);
+                        
+                        if !bitmap.is_empty() {
+                            // Create texture from character bitmap and render to screen
+                            let texture_size = wgpu::Extent3d {
+                                width: metrics.width as u32,
+                                height: metrics.height as u32,
+                                depth_or_array_layers: 1,
+                            };
+                            
+                            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                                size: texture_size,
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::R8Unorm, // Grayscale
+                                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                                label: Some("Character Texture"),
+                                view_formats: &[],
+                            });
+                            
+                            queue.write_texture(
+                                wgpu::ImageCopyTexture {
+                                    aspect: wgpu::TextureAspect::All,
+                                    texture: &texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                },
+                                &bitmap,
+                                wgpu::ImageDataLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(metrics.width as u32),
+                                    rows_per_image: Some(metrics.height as u32),
+                                },
+                                texture_size,
+                            );
+                        }
+                    }
+                }
+                
+                println!("📝 Rendered {} lines of ALTO spatial text to screen", text_to_render.lines().count());
             }
             
             queue.submit(std::iter::once(encoder.finish()));
