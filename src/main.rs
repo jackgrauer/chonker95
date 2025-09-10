@@ -23,101 +23,132 @@ impl UnifiedAltoElement {
     }
 }
 
-// QUANTIZED ALTO GRID - Convert ALTO to unified text grid
-struct QuantizedAltoGrid {
-    grid_text: String,           // Unified text document  
-    // Simplified: Only need the text content for editing
+// TERMINAL GRID - Fixed character grid with ALTO spatial mapping
+struct TerminalGrid {
+    grid: Vec<Vec<char>>,         // 2D character array (like terminal buffer)
+    grid_width: usize,           // Fixed grid width (e.g., 120 columns)
+    grid_height: usize,          // Fixed grid height (e.g., 50 rows)
+    char_width: f32,             // ALTO pixels per character
+    line_height: f32,            // ALTO pixels per line
 }
 
-impl QuantizedAltoGrid {
-    fn from_alto_elements(elements: &[UnifiedAltoElement]) -> Self {
-        // TRUST PDFALTO: Minimal processing, preserve text flow
-        let mut sorted_elements = elements.to_vec();
-        sorted_elements.sort_by(|a, b| {
-            a.vpos.partial_cmp(&b.vpos).unwrap().then_with(|| a.hpos.partial_cmp(&b.hpos).unwrap())
-        });
+impl TerminalGrid {
+    fn new() -> Self {
+        Self {
+            grid: vec![vec![' '; 140]; 60], // Larger grid for more space
+            grid_width: 140,
+            grid_height: 60,
+            char_width: 4.5,  // Smaller units per character (more resolution)
+            line_height: 9.0, // Smaller units per line (more resolution)
+        }
+    }
+    
+    // Map ALTO coordinates directly to grid cells
+    fn alto_to_grid(&self, hpos: f32, vpos: f32) -> (usize, usize) {
+        let col = (hpos / self.char_width) as usize;
+        let row = (vpos / self.line_height) as usize;
+        (col.min(self.grid_width - 1), row.min(self.grid_height - 1))
+    }
+    
+    // Place ALTO element directly in grid at calculated position
+    fn place_element(&mut self, element: &UnifiedAltoElement) {
+        let (start_col, row) = self.alto_to_grid(element.hpos, element.vpos);
         
-        println!("📊 Processing {} ALTO elements for text reconstruction", sorted_elements.len());
-        
-        // SIMPLE APPROACH: Just join elements with minimal formatting
-        let mut full_text = String::new();
-        let mut last_vpos = -1.0;
-        let mut line_start_hpos = 0.0;
-        
-        for (idx, element) in sorted_elements.iter().enumerate() {
-            // SMART PARAGRAPH DETECTION using VPOS gaps
-            let vpos_gap = element.vpos - last_vpos;
-            if vpos_gap > 10.0 && last_vpos >= 0.0 {
-                // Line break threshold
-                full_text.push('\n');
-                
-                // PARAGRAPH BREAK: Large gaps indicate new paragraphs  
-                if vpos_gap > 20.0 {
-                    full_text.push('\n'); // Extra line for paragraph separation
-                    println!("📄 PARAGRAPH BREAK detected at element {} (gap={:.1}px)", idx, vpos_gap);
-                }
-                
-                // SECTION BREAK: Very large gaps indicate new sections
-                if vpos_gap > 40.0 {
-                    full_text.push('\n'); // Extra spacing for sections
-                    println!("📚 SECTION BREAK detected at element {} (gap={:.1}px)", idx, vpos_gap);
-                }
-                
-                line_start_hpos = element.hpos;
+        // Place each character of the element
+        for (i, ch) in element.content.chars().enumerate() {
+            let col = start_col + i;
+            if col < self.grid_width && row < self.grid_height {
+                self.grid[row][col] = ch;
             }
-            
-            // SIMPLE WORD SPACING: Just add space between words (fix the smashing!)
-            if !full_text.ends_with('\n') && idx > 0 {
-                full_text.push(' '); // Always add space between elements
-            }
-            
-            full_text.push_str(&element.content);
-            last_vpos = element.vpos;
-            
-            // Debug: Show progress for first few elements and last few
-            if idx < 10 || idx >= sorted_elements.len() - 10 {
-                println!("Element {}: '{}' at VPOS={:.1} (gap={:.1})", 
-                         idx, element.content, element.vpos, vpos_gap);
+        }
+    }
+    
+    // Convert grid to editable text
+    fn to_text(&self) -> String {
+        self.grid.iter()
+            .map(|row| row.iter().collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string()
+    }
+    
+    // Update grid from edited text (reverse mapping)
+    fn from_text(&mut self, text: &str) {
+        // Clear grid
+        for row in &mut self.grid {
+            for cell in row {
+                *cell = ' ';
             }
         }
         
-        println!("📄 Built text document: {} characters total", full_text.len());
-        println!("🔚 Last 100 chars: '{}'", 
-                 full_text.chars().rev().take(100).collect::<String>().chars().rev().collect::<String>());
-        
-        Self { grid_text: full_text }
-    }
-    
-    
-    fn show(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        ui.heading("📝 QUANTIZED ALTO DOCUMENT");
-        ui.label(format!("Grid text length: {} chars", self.grid_text.len()));
-        ui.label("DEBUG: First 100 chars:");
-        ui.label(format!("'{}'", self.grid_text.chars().take(100).collect::<String>()));
-        
-        // ONE BIG TEXT EDITOR with ALTO-derived spacing
-        ui.add_sized(
-            ui.available_size(),
-            egui::TextEdit::multiline(&mut self.grid_text)
-                .font(egui::TextStyle::Monospace)
-                .desired_width(f32::INFINITY)
-                .code_editor()
-        )
+        // Place text back in grid
+        for (row_idx, line) in text.lines().enumerate() {
+            if row_idx < self.grid_height {
+                for (col_idx, ch) in line.chars().enumerate() {
+                    if col_idx < self.grid_width {
+                        self.grid[row_idx][col_idx] = ch;
+                    }
+                }
+            }
+        }
     }
 }
 
 // SIMPLIFIED ALTO EDITOR
 struct UnifiedAltoEditor {
-    quantized_grid: QuantizedAltoGrid,
+    terminal_grid: TerminalGrid,
+    grid_text: String, // Current editable text
 }
 
 impl UnifiedAltoEditor {
     fn new() -> Self {
         // LOAD FULL PDF PAGE: Get all ALTO elements from PDF
         let elements = Self::load_full_alto_page();
-        let quantized_grid = QuantizedAltoGrid::from_alto_elements(&elements);
+        let mut terminal_grid = TerminalGrid::new();
         
-        Self { quantized_grid }
+        // HYBRID APPROACH: Use ALTO for line positioning, then flow text naturally  
+        let mut lines = std::collections::BTreeMap::new();
+        
+        // Group elements by line (similar VPOS)
+        for element in &elements {
+            let line_key = (element.vpos / 12.0) as i32;
+            lines.entry(line_key).or_insert_with(Vec::new).push(element);
+        }
+        
+        // Place each line at ALTO Y position, then flow text normally on that line
+        for (line_key, mut line_elements) in lines {
+            line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
+            
+            if let Some(first_element) = line_elements.first() {
+                let (start_col, row) = terminal_grid.alto_to_grid(first_element.hpos, first_element.vpos);
+                let mut current_col = start_col;
+                
+                // Flow text naturally on this line
+                for (word_idx, element) in line_elements.iter().enumerate() {
+                    // Add space between words
+                    if word_idx > 0 && current_col < terminal_grid.grid_width {
+                        terminal_grid.grid[row][current_col] = ' ';
+                        current_col += 1;
+                    }
+                    
+                    // Place word characters sequentially
+                    for ch in element.content.chars() {
+                        if current_col < terminal_grid.grid_width && row < terminal_grid.grid_height {
+                            terminal_grid.grid[row][current_col] = ch;
+                            current_col += 1;
+                        }
+                    }
+                }
+            }
+        }
+        
+        let grid_text = terminal_grid.to_text();
+        
+        println!("📟 TERMINAL GRID: Placed {} elements in {}×{} grid", 
+                 elements.len(), terminal_grid.grid_width, terminal_grid.grid_height);
+        
+        Self { terminal_grid, grid_text }
     }
     
     fn load_full_alto_page() -> Vec<UnifiedAltoElement> {
@@ -193,13 +224,39 @@ impl UnifiedAltoEditor {
     }
     
     fn show(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        // QUANTIZED GRID EDITOR: One cohesive document with ALTO spacing
-        self.quantized_grid.show(ui)
+        // TERMINAL GRID EDITOR: Fixed grid with ALTO spatial awareness
+        let response = ui.add_sized(
+            ui.available_size(),
+            egui::TextEdit::multiline(&mut self.grid_text)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+        );
+        
+        // Sync: Update terminal grid when text is edited
+        if response.changed() {
+            self.terminal_grid.from_text(&self.grid_text);
+        }
+        
+        response
     }
     
     fn export_alto_xml(&self) -> String {
-        // Simple XML export (could be enhanced to reconstruct from text)
-        format!("<!-- Edited ALTO text -->\n{}", self.quantized_grid.grid_text)
+        // Generate sample ALTO XML structure for display
+        let mut xml = String::from("<?xml version=\"1.0\"?>\n<alto xmlns=\"http://www.loc.gov/standards/alto/ns-v3#\">\n<Layout>\n<Page WIDTH=\"612\" HEIGHT=\"792\">\n<PrintSpace>\n<TextBlock>\n<TextLine>\n");
+        
+        // Add first few lines of content as ALTO XML structure
+        let lines: Vec<&str> = self.grid_text.lines().take(5).collect();
+        for (i, line) in lines.iter().enumerate() {
+            let y_pos = 84.8 + (i as f32 * 24.0);
+            for (j, word) in line.split_whitespace().enumerate().take(8) {
+                let x_pos = 78.0 + (j as f32 * 60.0);
+                xml.push_str(&format!("<String ID=\"s{}{}\" CONTENT=\"{}\" HPOS=\"{:.1}\" VPOS=\"{:.1}\" WIDTH=\"50.0\" HEIGHT=\"12.0\"/>\n",
+                                      i, j, word, x_pos, y_pos));
+            }
+        }
+        
+        xml.push_str("</TextLine>\n</TextBlock>\n</PrintSpace>\n</Page>\n</Layout>\n</alto>");
+        xml
     }
 }
 
@@ -218,26 +275,53 @@ impl Default for AltoApp {
 
 impl eframe::App for AltoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::SidePanel::left("xml").show(ctx, |ui| {
-            ui.heading("📄 ALTO XML Output");
-            ui.label("Updated automatically when you edit");
-            
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add(egui::TextEdit::multiline(&mut self.exported_xml.as_str())
-                    .font(egui::TextStyle::Monospace)
-                    .code_editor());
+        // DOS AESTHETIC: Terminal colors, no rounded corners
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::BLACK;
+        visuals.window_fill = egui::Color32::BLACK;
+        visuals.faint_bg_color = egui::Color32::from_gray(20);
+        visuals.extreme_bg_color = egui::Color32::from_gray(10);
+        visuals.override_text_color = Some(egui::Color32::from_rgb(0, 255, 0)); // DOS green
+        visuals.window_shadow = egui::epaint::Shadow::NONE;
+        ctx.set_visuals(visuals);
+        
+        // DOS-style split screen: No fancy panels, just raw divisions
+        let available = ctx.available_rect();
+        let split_x = available.width() * 0.3;
+        
+        // Left: ALTO XML (terminal style)
+        let left_rect = egui::Rect::from_min_size(
+            available.min,
+            egui::vec2(split_x, available.height())
+        );
+        
+        // DOS SPLIT SCREEN: Simple left/right division
+        egui::SidePanel::left("alto_xml")
+            .exact_width(split_x)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+                
+                // DOS prompt style
+                ui.colored_label(egui::Color32::from_rgb(255, 255, 0), "C:\\ALTO> ");
+                ui.separator();
+                
+                // Terminal-style XML display
+                ui.add_sized(
+                    ui.available_size(),
+                    egui::TextEdit::multiline(&mut self.exported_xml.as_str())
+                        .font(egui::TextStyle::Monospace)
+                );
             });
-            
-            if ui.button("🔄 Refresh XML").clicked() {
-                self.exported_xml = self.editor.export_alto_xml();
-            }
-        });
         
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("📝 QUANTIZED ALTO TEXT GRID");
-            ui.label("One unified document • ALTO spacing preserved • Edit like a normal text file");
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
             
-            // QUANTIZED GRID EDITOR: One cohesive text document
+            // DOS prompt style
+            ui.colored_label(egui::Color32::from_rgb(255, 255, 0), "C:\\EDIT> ");
+            ui.separator();
+            
+            // Terminal-style text editor
             self.editor.show(ui);
         });
     }
