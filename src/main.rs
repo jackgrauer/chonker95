@@ -2,7 +2,6 @@ use anyhow::Result;
 use eframe;
 use egui;
 use ropey::Rope;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -10,6 +9,20 @@ struct UnifiedAltoElement {
     content: String,
     hpos: f32,
     vpos: f32,
+}
+
+#[derive(Debug, Clone)]
+struct Word {
+    content: String,
+    hpos: f32,
+    vpos: f32,
+}
+
+#[derive(Debug, Clone)]
+struct Line {
+    words: Vec<Word>,
+    avg_vpos: f32,
+    is_table: bool,
 }
 
 impl UnifiedAltoElement {
@@ -103,13 +116,8 @@ impl UnifiedAltoEditor {
             rope_dirty: true,
             state: EditorState::default() 
         };
-        // Show welcome message instead of loading hardcoded PDF
-        let welcome_elements = vec![
-            UnifiedAltoElement::new("CHONKER 9.5".to_string(), 160.8, 84.8),
-            UnifiedAltoElement::new("Text Editor".to_string(), 150.0, 110.0),
-            UnifiedAltoElement::new("Load a PDF to see extracted text here".to_string(), 70.0, 140.0),
-        ];
-        editor.rebuild_grid(welcome_elements);
+        // Start with empty text editor
+        editor.rebuild_grid(vec![]);
         editor
     }
     
@@ -124,77 +132,131 @@ impl UnifiedAltoEditor {
         }
     }
     
-    fn rebuild_grid(&mut self, elements: Vec<UnifiedAltoElement>) {
-        // Group elements by line (similar VPOS)
-        let mut lines = std::collections::BTreeMap::new();
-        for element in &elements {
-            let line_key = (element.vpos / 12.0) as i32;
-            lines.entry(line_key).or_insert_with(Vec::new).push(element);
+    // Step 1: Word Extraction  
+    fn extract_words(&self, elements: &[UnifiedAltoElement]) -> Vec<Word> {
+        elements.iter()
+            .map(|elem| Word {
+                content: elem.content.clone(),
+                hpos: elem.hpos,
+                vpos: elem.vpos,
+            })
+            .collect()
+    }
+    
+    // Step 2: Line Formation
+    fn form_lines(&self, words: Vec<Word>) -> Vec<Line> {
+        let mut lines_map = std::collections::BTreeMap::new();
+        
+        for word in words {
+            let line_key = (word.vpos / 12.0) as i32; // Group by similar vpos
+            lines_map.entry(line_key).or_insert_with(Vec::new).push(word);
         }
         
-        // Calculate required grid dimensions
-        let max_line_key = lines.keys().max().copied().unwrap_or(0) as usize;
-        let mut max_col = 0;
-        
-        for line_elements in lines.values() {
-            let mut sorted_elements = line_elements.clone();
-            sorted_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
-            
-            if let Some(first_element) = sorted_elements.first() {
-                let start_col = (first_element.hpos / 4.5) as usize;
-                let mut current_col = start_col;
-                
-                for (word_idx, element) in sorted_elements.iter().enumerate() {
-                    if word_idx > 0 {
-                        current_col += 1; // space
-                    }
-                    current_col += element.content.chars().count();
+        lines_map.into_iter()
+            .map(|(_, mut words)| {
+                words.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
+                let avg_vpos = words.iter().map(|w| w.vpos).sum::<f32>() / words.len() as f32;
+                Line {
+                    words,
+                    avg_vpos,
+                    is_table: false, // Will be set by detector
                 }
-                
-                max_col = max_col.max(current_col);
-            }
-        }
-        
-        // Create appropriately sized grid - use line_key directly for height
-        let grid_width = (max_col + 20).max(140);
-        let grid_height = (max_line_key + 10).max(60);
-        
-        self.terminal_grid = TerminalGrid::new_with_size(grid_width, grid_height);
-        
-        // Place text using line_key as the row position
-        for (line_key, mut line_elements) in lines {
-            line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
+            })
+            .collect()
+    }
+    
+    // Step 3: Table Detection Lever
+    fn detect_tables(&self, lines: &mut [Line]) {
+        for i in 0..lines.len() {
+            if lines[i].words.len() < 2 { continue; }
             
-            let row = line_key as usize;
-            if row >= self.terminal_grid.grid_height {
-                continue;
-            }
+            // Look for vertical alignment patterns
+            let mut alignment_score = 0;
+            let current_positions: Vec<f32> = lines[i].words.iter().map(|w| w.hpos).collect();
             
-            if let Some(first_element) = line_elements.first() {
-                let start_col = (first_element.hpos / self.terminal_grid.char_width) as usize;
-                let mut current_col = start_col;
+            // Check lines above and below for similar hpos patterns
+            for j in 0..lines.len() {
+                if i == j || lines[j].words.len() < 2 { continue; }
                 
-                // Flow text naturally on this line
-                for (word_idx, element) in line_elements.iter().enumerate() {
-                    // Add space between words
-                    if word_idx > 0 && current_col < self.terminal_grid.grid_width {
-                        self.terminal_grid.grid[row][current_col] = ' ';
-                        current_col += 1;
-                    }
-                    
-                    // Place word characters (no wrapping to preserve layout)
-                    for ch in element.content.chars() {
-                        if current_col < self.terminal_grid.grid_width {
-                            self.terminal_grid.grid[row][current_col] = ch;
-                            current_col += 1;
+                let other_positions: Vec<f32> = lines[j].words.iter().map(|w| w.hpos).collect();
+                
+                // Count how many positions align (within tolerance)
+                for &pos1 in &current_positions {
+                    for &pos2 in &other_positions {
+                        if (pos1 - pos2).abs() < 20.0 { // 20px tolerance
+                            alignment_score += 1;
                         }
                     }
                 }
             }
+            
+            // If we find enough alignments, mark as table
+            lines[i].is_table = alignment_score > lines[i].words.len() * 2;
+        }
+    }
+    
+    // Step 4: Formatter Behavior
+    fn format_line(&self, line: &Line) -> String {
+        if !line.is_table {
+            // Paragraph mode: natural spacing
+            line.words.iter().map(|w| w.content.as_str()).collect::<Vec<_>>().join(" ")
+        } else {
+            // Table mode: coordinate-aligned spacing
+            let mut result = String::new();
+            let mut current_pos = 0.0;
+            
+            for (i, word) in line.words.iter().enumerate() {
+                if i > 0 {
+                    let spaces_needed = ((word.hpos - current_pos) / 4.5).max(1.0).min(20.0) as usize;
+                    result.push_str(&" ".repeat(spaces_needed));
+                }
+                result.push_str(&word.content);
+                current_pos = word.hpos + (word.content.len() as f32 * 4.5);
+            }
+            result
+        }
+    }
+
+    fn rebuild_grid(&mut self, elements: Vec<UnifiedAltoElement>) {
+        // Step 1: Extract words
+        let words = self.extract_words(&elements);
+        
+        // Step 2: Form lines
+        let mut lines = self.form_lines(words);
+        
+        // Step 3: Detect tables
+        self.detect_tables(&mut lines);
+        
+        // Step 4 & 5: Format and assemble output with preserved spacing
+        let mut formatted_text = String::new();
+        
+        if !lines.is_empty() {
+            // Sort lines by their vertical position
+            lines.sort_by(|a, b| a.avg_vpos.partial_cmp(&b.avg_vpos).unwrap());
+            
+            let mut last_vpos = lines[0].avg_vpos;
+            
+            for line in lines {
+                // Calculate how many line breaks should exist based on vertical gap
+                let vpos_gap = line.avg_vpos - last_vpos;
+                let line_breaks_needed = (vpos_gap / 12.0).round() as i32; // 12pt = typical line height
+                
+                // Add empty lines for gaps (minimum 1, maximum 5 to prevent huge gaps)
+                let empty_lines = line_breaks_needed.max(1).min(5) - 1;
+                for _ in 0..empty_lines {
+                    formatted_text.push('\n');
+                }
+                
+                let formatted_line = self.format_line(&line);
+                formatted_text.push_str(&formatted_line);
+                formatted_text.push('\n');
+                
+                last_vpos = line.avg_vpos;
+            }
         }
         
-        let text = self.terminal_grid.to_text();
-        self.grid_rope = Rope::from_str(&text);
+        // Update rope with formatted text
+        self.grid_rope = Rope::from_str(&formatted_text);
         self.grid_text_cache = None;
         self.rope_dirty = true;
     }
@@ -375,7 +437,6 @@ struct AltoApp {
     pdf_path: Option<PathBuf>,
     current_page: usize,
     total_pages: usize,
-    page_cache: HashMap<usize, egui::TextureHandle>,
     // Zoom state
     zoom_level: f32,
 }
@@ -388,7 +449,6 @@ impl Default for AltoApp {
             pdf_path: None,
             current_page: 1,
             total_pages: 0,
-            page_cache: HashMap::new(),
             zoom_level: 2.0,
         }
     }
@@ -398,7 +458,6 @@ impl AltoApp {
     fn open_pdf(&mut self, path: PathBuf) {
         self.pdf_path = Some(path.clone());
         self.current_page = 1;
-        self.page_cache.clear();
         
         // Get total page count using pdfinfo
         if let Ok(output) = std::process::Command::new("pdfinfo")
@@ -432,21 +491,15 @@ impl AltoApp {
         }
     }
     
-    fn render_pdf_page(&mut self, ctx: &egui::Context, page: usize) -> Option<&egui::TextureHandle> {
-        if self.page_cache.contains_key(&page) {
-            return self.page_cache.get(&page);
-        }
+    fn render_pdf_page(&mut self, ctx: &egui::Context, page: usize) -> Option<egui::TextureHandle> {
+        // No caching - generate fresh each time for better performance debugging
         
         let pdf_path = self.pdf_path.as_ref()?;
         let temp_file = format!("/tmp/chonker_page_{}", page);
         
-        // Calculate scaled size based on zoom level (larger base for better readability)
-        let base_width = 600.0;
+        // Calculate scaled size based on zoom level (much smaller for performance)
+        let base_width = 400.0;  // Reduced for performance
         let scaled_width = (base_width * self.zoom_level) as u32;
-        
-        println!("DEBUG: Rendering page {} from PDF: {}", page, pdf_path.display());
-        println!("DEBUG: Temp file base: {}", temp_file);
-        println!("DEBUG: Scaled width: {}", scaled_width);
         
         // Use pdftoppm to render the page
         let result = std::process::Command::new("pdftoppm")
@@ -463,29 +516,7 @@ impl AltoApp {
             
         match result {
             Ok(output) => {
-                if output.status.success() {
-                    println!("DEBUG: pdftoppm command succeeded");
-                    let image_path = format!("{}-{:02}.png", temp_file, page);
-                    println!("DEBUG: Looking for image at: {}", image_path);
-                    
-                    if std::path::Path::new(&image_path).exists() {
-                        println!("DEBUG: Image file exists, trying to load");
-                        match image::open(&image_path) {
-                            Ok(img) => {
-                                println!("DEBUG: Successfully loaded image");
-                            },
-                            Err(e) => {
-                                println!("DEBUG: Failed to load image: {}", e);
-                                return None;
-                            }
-                        }
-                    } else {
-                        println!("DEBUG: Image file does not exist at expected path");
-                        return None;
-                    }
-                } else {
-                    println!("DEBUG: pdftoppm command failed with status: {}", output.status);
-                    println!("DEBUG: stderr: {}", String::from_utf8_lossy(&output.stderr));
+                if !output.status.success() {
                     return None;
                 }
             },
@@ -495,29 +526,42 @@ impl AltoApp {
             }
         }
         
-        let image_path = format!("{}-{:02}.png", temp_file, page);
+        // Try both zero-padded and non-zero-padded formats
+        let image_path_padded = format!("{}-{:02}.png", temp_file, page);
+        let image_path_simple = format!("{}-{}.png", temp_file, page);
+        
+        let image_path = if std::path::Path::new(&image_path_padded).exists() {
+            image_path_padded
+        } else {
+            image_path_simple
+        };
+        
         if let Ok(img) = image::open(&image_path) {
             let mut rgba_img = img.to_rgba8();
             
-            // Invert colors for dark mode
+            // Convert to grayscale and invert for dark mode
             for pixel in rgba_img.pixels_mut() {
-                // Invert RGB channels, keep alpha
-                pixel[0] = 255 - pixel[0]; // Red
-                pixel[1] = 255 - pixel[1]; // Green  
-                pixel[2] = 255 - pixel[2]; // Blue
+                // Fast grayscale conversion using integer math
+                let gray = ((pixel[0] as u16 * 77 + pixel[1] as u16 * 151 + pixel[2] as u16 * 28) >> 8) as u8;
+                
+                // Invert grayscale for dark mode (white text on dark background)
+                let inverted_gray = 255 - gray;
+                
+                // Set all channels to the inverted grayscale value
+                pixel[0] = inverted_gray;
+                pixel[1] = inverted_gray;
+                pixel[2] = inverted_gray;
                 // pixel[3] stays the same (Alpha)
             }
             
             let size = [rgba_img.width() as usize, rgba_img.height() as usize];
             let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba_img);
-            let texture = ctx.load_texture(format!("page_{}", page), color_image, egui::TextureOptions::LINEAR);
+            let texture = ctx.load_texture(format!("page_{}_grayscale_{}", page, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()), color_image, egui::TextureOptions::NEAREST);
             
-            // Clean up temp file
+            // Clean up temp file immediately
             let _ = std::fs::remove_file(&image_path);
             
-            self.page_cache.insert(page, texture);
-            println!("DEBUG: Successfully cached texture for page {}", page);
-            return self.page_cache.get(&page);
+            return Some(texture);
         } else {
             println!("DEBUG: Failed to open image file: {}", image_path);
         }
@@ -541,7 +585,7 @@ impl AltoApp {
             let scroll_response = scroll_area.show(ui, |ui| {
                 ui.add_sized(
                     display_size,
-                    egui::Image::new(texture)
+                    egui::Image::new(&texture)
                         .bg_fill(egui::Color32::BLACK)
                         .sense(egui::Sense::drag())
                 )
@@ -581,15 +625,12 @@ impl eframe::App for AltoApp {
                 if i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus) {
                     // Zoom in (faster steps)
                     self.zoom_level = (self.zoom_level * 1.5).min(5.0);
-                    self.page_cache.clear(); // Clear cache to regenerate at new zoom
                 } else if i.key_pressed(egui::Key::Minus) {
                     // Zoom out (faster steps)
                     self.zoom_level = (self.zoom_level / 1.5).max(0.3);
-                    self.page_cache.clear(); // Clear cache to regenerate at new zoom
                 } else if i.key_pressed(egui::Key::Num0) {
                     // Reset zoom
                     self.zoom_level = 2.0;
-                    self.page_cache.clear();
                 }
             }
             
