@@ -1,6 +1,8 @@
 use anyhow::Result;
 use eframe;
 use egui;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 struct UnifiedAltoElement {
@@ -91,13 +93,18 @@ struct UnifiedAltoEditor {
 
 impl UnifiedAltoEditor {
     fn new() -> Self {
-        let elements = Self::load_alto_page(1);
         let mut editor = Self { 
             terminal_grid: TerminalGrid::new(), 
             grid_text: String::new(), 
             state: EditorState::default() 
         };
-        editor.rebuild_grid(elements);
+        // Show welcome message instead of loading hardcoded PDF
+        let welcome_elements = vec![
+            UnifiedAltoElement::new("CHONKER 9.5".to_string(), 160.8, 84.8),
+            UnifiedAltoElement::new("Text Editor".to_string(), 150.0, 110.0),
+            UnifiedAltoElement::new("Load a PDF to see extracted text here".to_string(), 70.0, 140.0),
+        ];
+        editor.rebuild_grid(welcome_elements);
         editor
     }
     
@@ -175,16 +182,24 @@ impl UnifiedAltoEditor {
     
     fn load_page(&mut self, page: u32) {
         self.state.current_page = page;
-        let elements = Self::load_alto_page(page);
+        // This method is kept for backward compatibility but should not be used
+        // when a specific PDF path is available
+        let elements = Self::create_fallback_elements();
         self.rebuild_grid(elements);
     }
     
-    fn load_alto_page(page: u32) -> Vec<UnifiedAltoElement> {
+    fn load_page_from_pdf(&mut self, pdf_path: &str, page: u32) {
+        self.state.current_page = page;
+        let elements = Self::load_alto_page_from_pdf(pdf_path, page);
+        self.rebuild_grid(elements);
+    }
+    
+    fn load_alto_page_from_pdf(pdf_path: &str, page: u32) -> Vec<UnifiedAltoElement> {
         // Extract all ALTO elements from PDF using our proven parsing
         
         std::process::Command::new("pdfalto")
             .args(["-f", &page.to_string(), "-l", &page.to_string(), "-readingOrder", "-noImage", "-noLineNumbers",
-                   "/Users/jack/Documents/chonker_test.pdf", "/dev/stdout"])
+                   pdf_path, "/dev/stdout"])
             .output()
             .ok()
             .filter(|output| output.status.success())
@@ -295,11 +310,14 @@ impl UnifiedAltoEditor {
                 let content_width = self.terminal_grid.grid_width as f32 * char_width;
                 let content_height = self.terminal_grid.grid_height as f32 * line_height;
                 
+                // Dramatically extend content width to prevent wrapping when zoomed
+                let extended_width = content_width * 5.0; // Much wider to handle zoom
+                
                 let response = ui.add_sized(
-                    egui::vec2(content_width, content_height),
+                    egui::vec2(extended_width, content_height),
                     egui::TextEdit::multiline(&mut self.grid_text)
                         .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
+                        .desired_width(extended_width)
                         .frame(false)
                 );
                 
@@ -326,36 +344,333 @@ impl UnifiedAltoEditor {
 
 struct AltoApp {
     editor: UnifiedAltoEditor,
+    // PDF display state
+    pdf_path: Option<PathBuf>,
+    current_page: usize,
+    total_pages: usize,
+    page_cache: HashMap<usize, egui::TextureHandle>,
+    // Zoom state
+    zoom_level: f32,
 }
 
 impl Default for AltoApp {
     fn default() -> Self {
         let editor = UnifiedAltoEditor::new();
-        Self { editor }
+        Self { 
+            editor,
+            pdf_path: None,
+            current_page: 1,
+            total_pages: 0,
+            page_cache: HashMap::new(),
+            zoom_level: 1.5,
+        }
+    }
+}
+
+impl AltoApp {
+    fn open_pdf(&mut self, path: PathBuf) {
+        self.pdf_path = Some(path.clone());
+        self.current_page = 1;
+        self.page_cache.clear();
+        
+        // Get total page count using pdfinfo
+        if let Ok(output) = std::process::Command::new("pdfinfo")
+            .arg(&path)
+            .output()
+        {
+            if output.status.success() {
+                let info = String::from_utf8_lossy(&output.stdout);
+                for line in info.lines() {
+                    if line.starts_with("Pages:") {
+                        if let Some(pages_str) = line.split_whitespace().nth(1) {
+                            self.total_pages = pages_str.parse().unwrap_or(1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sync text editor to the current page
+        self.sync_text_editor_page();
+    }
+    
+    fn sync_text_editor_page(&mut self) {
+        // Update text editor to show the same page as PDF viewer
+        if let Some(pdf_path) = &self.pdf_path {
+            self.editor.load_page_from_pdf(
+                pdf_path.to_str().unwrap_or(""), 
+                self.current_page as u32
+            );
+        }
+    }
+    
+    fn render_pdf_page(&mut self, ctx: &egui::Context, page: usize) -> Option<&egui::TextureHandle> {
+        if self.page_cache.contains_key(&page) {
+            return self.page_cache.get(&page);
+        }
+        
+        let pdf_path = self.pdf_path.as_ref()?;
+        let temp_file = format!("/tmp/chonker_page_{}", page);
+        
+        // Calculate scaled size based on zoom level (lowered base for performance)
+        let base_width = 400.0;
+        let scaled_width = (base_width * self.zoom_level) as u32;
+        
+        println!("DEBUG: Rendering page {} from PDF: {}", page, pdf_path.display());
+        println!("DEBUG: Temp file base: {}", temp_file);
+        println!("DEBUG: Scaled width: {}", scaled_width);
+        
+        // Use pdftoppm to render the page
+        let result = std::process::Command::new("pdftoppm")
+            .args([
+                "-f", &page.to_string(),
+                "-l", &page.to_string(),
+                "-png",
+                "-scale-to-x", &scaled_width.to_string(),
+                "-scale-to-y", "-1",  // Maintain aspect ratio
+            ])
+            .arg(pdf_path)
+            .arg(&temp_file)
+            .output();
+            
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    println!("DEBUG: pdftoppm command succeeded");
+                    let image_path = format!("{}-{}.png", temp_file, page);
+                    println!("DEBUG: Looking for image at: {}", image_path);
+                    
+                    if std::path::Path::new(&image_path).exists() {
+                        println!("DEBUG: Image file exists, trying to load");
+                        match image::open(&image_path) {
+                            Ok(img) => {
+                                println!("DEBUG: Successfully loaded image");
+                            },
+                            Err(e) => {
+                                println!("DEBUG: Failed to load image: {}", e);
+                                return None;
+                            }
+                        }
+                    } else {
+                        println!("DEBUG: Image file does not exist at expected path");
+                        return None;
+                    }
+                } else {
+                    println!("DEBUG: pdftoppm command failed with status: {}", output.status);
+                    println!("DEBUG: stderr: {}", String::from_utf8_lossy(&output.stderr));
+                    return None;
+                }
+            },
+            Err(e) => {
+                println!("DEBUG: Failed to execute pdftoppm: {}", e);
+                return None;
+            }
+        }
+        
+        let image_path = format!("{}-{}.png", temp_file, page);
+        if let Ok(img) = image::open(&image_path) {
+            let mut rgba_img = img.to_rgba8();
+            
+            // Invert colors for dark mode
+            for pixel in rgba_img.pixels_mut() {
+                // Invert RGB channels, keep alpha
+                pixel[0] = 255 - pixel[0]; // Red
+                pixel[1] = 255 - pixel[1]; // Green  
+                pixel[2] = 255 - pixel[2]; // Blue
+                // pixel[3] stays the same (Alpha)
+            }
+            
+            let size = [rgba_img.width() as usize, rgba_img.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba_img);
+            let texture = ctx.load_texture(format!("page_{}", page), color_image, egui::TextureOptions::LINEAR);
+            
+            // Clean up temp file
+            let _ = std::fs::remove_file(&image_path);
+            
+            self.page_cache.insert(page, texture);
+            println!("DEBUG: Successfully cached texture for page {}", page);
+            return self.page_cache.get(&page);
+        } else {
+            println!("DEBUG: Failed to open image file: {}", image_path);
+        }
+        
+        None
+    }
+    
+    fn show_pdf_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(texture) = self.render_pdf_page(ctx, self.current_page) {
+            let available_size = ui.available_size();
+            let image_size = texture.size_vec2();
+            
+            // Scale to fit available space
+            let scale = (available_size.x / image_size.x).min(available_size.y / image_size.y).min(1.0);
+            let display_size = image_size * scale;
+            
+            ui.allocate_ui_with_layout(
+                available_size,
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    ui.add(
+                        egui::Image::new(texture)
+                            .max_size(display_size)
+                            .bg_fill(egui::Color32::BLACK)
+                    );
+                }
+            );
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 120, 120),
+                    "PDF rendering failed or no PDF loaded"
+                );
+            });
+        }
     }
 }
 
 impl eframe::App for AltoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle keyboard shortcuts
+        ctx.input(|i| {
+            // Cmd+O to open PDF (Cmd on macOS, Ctrl on other platforms)
+            if i.modifiers.command && i.key_pressed(egui::Key::O) {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("PDF", &["pdf"])
+                    .pick_file()
+                {
+                    self.open_pdf(path);
+                }
+            }
+            
+            // Cmd+/Cmd- for zoom
+            if i.modifiers.command {
+                if i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus) {
+                    // Zoom in
+                    self.zoom_level = (self.zoom_level * 1.2).min(3.0);
+                    self.page_cache.clear(); // Clear cache to regenerate at new zoom
+                } else if i.key_pressed(egui::Key::Minus) {
+                    // Zoom out  
+                    self.zoom_level = (self.zoom_level / 1.2).max(0.3);
+                    self.page_cache.clear(); // Clear cache to regenerate at new zoom
+                } else if i.key_pressed(egui::Key::Num0) {
+                    // Reset zoom
+                    self.zoom_level = 1.0;
+                    self.page_cache.clear();
+                }
+            }
+            
+            // Arrow keys for navigation
+            if self.pdf_path.is_some() {
+                if i.key_pressed(egui::Key::ArrowLeft) && self.current_page > 1 {
+                    self.current_page -= 1;
+                    self.sync_text_editor_page();
+                } else if i.key_pressed(egui::Key::ArrowRight) && self.current_page < self.total_pages {
+                    self.current_page += 1;
+                    self.sync_text_editor_page();
+                }
+            }
+        });
+
         let mut visuals = egui::Visuals::dark();
-        visuals.override_text_color = Some(egui::Color32::from_rgb(0, 255, 0));
+        visuals.override_text_color = Some(egui::Color32::from_rgb(200, 200, 200));
         ctx.set_visuals(visuals);
+        
+        // Top panel for controls
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(200, 200, 200), "CHONKER 9.5");
+                ui.separator();
+                
+                // File open button
+                if ui.button("📁 Open PDF (Cmd+O)").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PDF", &["pdf"])
+                        .pick_file()
+                    {
+                        self.open_pdf(path);
+                    }
+                }
+                
+                ui.separator();
+                
+                // Show current PDF info if loaded
+                if let Some(path) = &self.pdf_path {
+                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                        ui.colored_label(egui::Color32::from_rgb(180, 180, 180), filename);
+                    }
+                    
+                    ui.separator();
+                    
+                    // Unified navigation (controls both PDF and text)
+                    if ui.add_enabled(self.current_page > 1, egui::Button::new("◀")).clicked() {
+                        self.current_page -= 1;
+                        self.sync_text_editor_page();
+                    }
+                    
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 200, 200),
+                        format!("Page {}/{}", self.current_page, self.total_pages)
+                    );
+                    
+                    if ui.add_enabled(self.current_page < self.total_pages, egui::Button::new("▶")).clicked() {
+                        self.current_page += 1;
+                        self.sync_text_editor_page();
+                    }
+                    
+                    ui.separator();
+                    
+                    // Zoom indicator
+                    ui.colored_label(
+                        egui::Color32::from_rgb(160, 160, 160),
+                        format!("{}%", (self.zoom_level * 100.0) as i32)
+                    );
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(120, 120, 120), "No PDF loaded");
+                }
+            });
+        });
+        
+        // Left side panel for PDF display
+        egui::SidePanel::left("pdf_panel")
+            .min_width(400.0)
+            .default_width(500.0)
+            .frame(egui::Frame::default().fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                if self.pdf_path.is_some() {
+                    self.show_pdf_page(ui, ctx);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(50.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(140, 140, 140),
+                                "Click 'Open PDF' to load a document"
+                            );
+                            ui.add_space(20.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(120, 120, 120),
+                                "PDF will appear here when loaded"
+                            );
+                        });
+                    });
+                }
+            });
+        
+        // Central panel for text editor
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-                ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(255, 255, 0), "CHONKER 9.5");
-                    ui.separator();
-                    if ui.button("◀").clicked() && self.editor.state.current_page > 1 {
-                        self.editor.load_page(self.editor.state.current_page - 1);
-                    }
-                    ui.colored_label(egui::Color32::from_rgb(255, 255, 0), 
-                                   format!("{}/{}", self.editor.state.current_page, self.editor.state.total_pages));
-                    if ui.button("▶").clicked() && self.editor.state.current_page < self.editor.state.total_pages {
-                        self.editor.load_page(self.editor.state.current_page + 1);
-                    }
-                });
+                // Apply zoom to text size
+                let mut style = ui.style().as_ref().clone();
+                let base_font_size = 12.0;
+                let zoomed_font_size = base_font_size * self.zoom_level;
+                
+                style.text_styles.insert(
+                    egui::TextStyle::Monospace,
+                    egui::FontId::new(zoomed_font_size, egui::FontFamily::Monospace)
+                );
+                ui.set_style(std::sync::Arc::new(style));
                 
                 self.editor.show(ui);
             });
