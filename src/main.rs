@@ -1,6 +1,7 @@
 use anyhow::Result;
 use eframe;
 use egui;
+use ropey::Rope;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -87,7 +88,9 @@ impl Default for EditorState {
 
 struct UnifiedAltoEditor {
     terminal_grid: TerminalGrid,
-    grid_text: String,
+    grid_rope: Rope,
+    grid_text_cache: Option<String>,
+    rope_dirty: bool,
     state: EditorState,
 }
 
@@ -95,7 +98,9 @@ impl UnifiedAltoEditor {
     fn new() -> Self {
         let mut editor = Self { 
             terminal_grid: TerminalGrid::new(), 
-            grid_text: String::new(), 
+            grid_rope: Rope::new(),
+            grid_text_cache: None,
+            rope_dirty: true,
             state: EditorState::default() 
         };
         // Show welcome message instead of loading hardcoded PDF
@@ -106,6 +111,17 @@ impl UnifiedAltoEditor {
         ];
         editor.rebuild_grid(welcome_elements);
         editor
+    }
+    
+    fn get_text_for_egui(&mut self) -> String {
+        if self.rope_dirty || self.grid_text_cache.is_none() {
+            let text = self.grid_rope.to_string();
+            self.grid_text_cache = Some(text.clone());
+            self.rope_dirty = false;
+            text
+        } else {
+            self.grid_text_cache.as_ref().unwrap().clone()
+        }
     }
     
     fn rebuild_grid(&mut self, elements: Vec<UnifiedAltoElement>) {
@@ -177,7 +193,10 @@ impl UnifiedAltoEditor {
             }
         }
         
-        self.grid_text = self.terminal_grid.to_text();
+        let text = self.terminal_grid.to_text();
+        self.grid_rope = Rope::from_str(&text);
+        self.grid_text_cache = None;
+        self.rope_dirty = true;
     }
     
     fn load_page(&mut self, page: u32) {
@@ -273,8 +292,8 @@ impl UnifiedAltoEditor {
             self.state.fake_scroll_x += input.raw_scroll_delta.x;
             
             // IMPROVED BOUNDS: Content width vs panel width with safety margins
-            let max_line_length = self.grid_text.lines()
-                .map(|line| line.chars().count())
+            let max_line_length = self.grid_rope.lines()
+                .map(|line| line.len_chars())
                 .max()
                 .unwrap_or(140) as f32;
             let panel_width = ui.available_width();
@@ -313,13 +332,21 @@ impl UnifiedAltoEditor {
                 // Dramatically extend content width to prevent wrapping when zoomed
                 let extended_width = content_width * 5.0; // Much wider to handle zoom
                 
+                let mut text_for_egui = self.get_text_for_egui();
                 let response = ui.add_sized(
                     egui::vec2(extended_width, content_height),
-                    egui::TextEdit::multiline(&mut self.grid_text)
+                    egui::TextEdit::multiline(&mut text_for_egui)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(extended_width)
                         .frame(false)
                 );
+                
+                // Update cache and rope if text was modified
+                if response.changed() {
+                    self.grid_rope = Rope::from_str(&text_for_egui);
+                    self.grid_text_cache = Some(text_for_egui);
+                    self.rope_dirty = false;
+                }
                 
                 // THROTTLED GRID UPDATES: Only update when text actually changes
                 if response.changed() {
@@ -327,7 +354,7 @@ impl UnifiedAltoEditor {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
                     let mut hasher = DefaultHasher::new();
-                    self.grid_text.hash(&mut hasher);
+                    self.grid_rope.to_string().hash(&mut hasher);
                     let new_hash = hasher.finish();
                     
                     if new_hash != self.state.last_text_hash {
@@ -362,7 +389,7 @@ impl Default for AltoApp {
             current_page: 1,
             total_pages: 0,
             page_cache: HashMap::new(),
-            zoom_level: 1.5,
+            zoom_level: 2.0,
         }
     }
 }
@@ -413,8 +440,8 @@ impl AltoApp {
         let pdf_path = self.pdf_path.as_ref()?;
         let temp_file = format!("/tmp/chonker_page_{}", page);
         
-        // Calculate scaled size based on zoom level (lowered base for performance)
-        let base_width = 400.0;
+        // Calculate scaled size based on zoom level (larger base for better readability)
+        let base_width = 600.0;
         let scaled_width = (base_width * self.zoom_level) as u32;
         
         println!("DEBUG: Rendering page {} from PDF: {}", page, pdf_path.display());
@@ -438,7 +465,7 @@ impl AltoApp {
             Ok(output) => {
                 if output.status.success() {
                     println!("DEBUG: pdftoppm command succeeded");
-                    let image_path = format!("{}-{}.png", temp_file, page);
+                    let image_path = format!("{}-{:02}.png", temp_file, page);
                     println!("DEBUG: Looking for image at: {}", image_path);
                     
                     if std::path::Path::new(&image_path).exists() {
@@ -468,7 +495,7 @@ impl AltoApp {
             }
         }
         
-        let image_path = format!("{}-{}.png", temp_file, page);
+        let image_path = format!("{}-{:02}.png", temp_file, page);
         if let Ok(img) = image::open(&image_path) {
             let mut rgba_img = img.to_rgba8();
             
@@ -499,25 +526,31 @@ impl AltoApp {
     }
     
     fn show_pdf_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if let Some(texture) = self.render_pdf_page(ctx, self.current_page) {
-            let available_size = ui.available_size();
+        let current_page = self.current_page;
+        if let Some(texture) = self.render_pdf_page(ctx, current_page) {
             let image_size = texture.size_vec2();
             
-            // Scale to fit available space
-            let scale = (available_size.x / image_size.x).min(available_size.y / image_size.y).min(1.0);
-            let display_size = image_size * scale;
+            // Use full image size without scaling down
+            let display_size = image_size;
             
-            ui.allocate_ui_with_layout(
-                available_size,
-                egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                |ui| {
-                    ui.add(
-                        egui::Image::new(texture)
-                            .max_size(display_size)
-                            .bg_fill(egui::Color32::BLACK)
-                    );
-                }
-            );
+            // Create scrollable area for panning
+            let scroll_area = egui::ScrollArea::both()
+                .auto_shrink([false; 2])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+                
+            let scroll_response = scroll_area.show(ui, |ui| {
+                ui.add_sized(
+                    display_size,
+                    egui::Image::new(texture)
+                        .bg_fill(egui::Color32::BLACK)
+                        .sense(egui::Sense::drag())
+                )
+            });
+            
+            // Handle drag for panning - update scroll offset
+            if scroll_response.inner.dragged() {
+                // egui ScrollArea handles dragging internally
+            }
         } else {
             ui.centered_and_justified(|ui| {
                 ui.colored_label(
@@ -546,16 +579,16 @@ impl eframe::App for AltoApp {
             // Cmd+/Cmd- for zoom
             if i.modifiers.command {
                 if i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus) {
-                    // Zoom in
-                    self.zoom_level = (self.zoom_level * 1.2).min(3.0);
+                    // Zoom in (faster steps)
+                    self.zoom_level = (self.zoom_level * 1.5).min(5.0);
                     self.page_cache.clear(); // Clear cache to regenerate at new zoom
                 } else if i.key_pressed(egui::Key::Minus) {
-                    // Zoom out  
-                    self.zoom_level = (self.zoom_level / 1.2).max(0.3);
+                    // Zoom out (faster steps)
+                    self.zoom_level = (self.zoom_level / 1.5).max(0.3);
                     self.page_cache.clear(); // Clear cache to regenerate at new zoom
                 } else if i.key_pressed(egui::Key::Num0) {
                     // Reset zoom
-                    self.zoom_level = 1.0;
+                    self.zoom_level = 2.0;
                     self.page_cache.clear();
                 }
             }
@@ -633,8 +666,8 @@ impl eframe::App for AltoApp {
         
         // Left side panel for PDF display
         egui::SidePanel::left("pdf_panel")
-            .min_width(400.0)
-            .default_width(500.0)
+            .min_width(600.0)
+            .default_width(800.0)
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 if self.pdf_path.is_some() {
