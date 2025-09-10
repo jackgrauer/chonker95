@@ -6,20 +6,16 @@ use egui;
 // SINGLE SOURCE OF TRUTH - Cannot desync because there's only one data structure
 #[derive(Debug, Clone)]
 struct UnifiedAltoElement {
-    // ALTO XML data (authoritative source)
-    id: String,
+    // ALTO XML data (only fields actually used)
     content: String,
     hpos: f32,
     vpos: f32,
-    width: f32,
-    height: f32,
-    
-    // Simplified: Only need ALTO data for quantization
+    // Note: id, width, height removed as they were unused
 }
 
 impl UnifiedAltoElement {
-    fn new(id: String, content: String, hpos: f32, vpos: f32, width: f32, height: f32, _scale: f32) -> Self {
-        Self { id, content, hpos, vpos, width, height }
+    fn new(_id: String, content: String, hpos: f32, vpos: f32, _width: f32, _height: f32, _scale: f32) -> Self {
+        Self { content, hpos, vpos }
     }
 }
 
@@ -50,20 +46,7 @@ impl TerminalGrid {
         (col.min(self.grid_width - 1), row.min(self.grid_height - 1))
     }
     
-    // Place ALTO element directly in grid at calculated position
-    fn place_element(&mut self, element: &UnifiedAltoElement) {
-        let (start_col, row) = self.alto_to_grid(element.hpos, element.vpos);
-        
-        // Place each character of the element
-        for (i, ch) in element.content.chars().enumerate() {
-            let col = start_col + i;
-            if col < self.grid_width && row < self.grid_height {
-                self.grid[row][col] = ch;
-            }
-        }
-    }
-    
-    // Convert grid to editable text
+    // Convert grid to editable text (keep - used by text generation)
     fn to_text(&self) -> String {
         self.grid.iter()
             .map(|row| row.iter().collect::<String>().trim_end().to_string())
@@ -72,36 +55,27 @@ impl TerminalGrid {
             .trim_end()
             .to_string()
     }
-    
-    // Update grid from edited text (reverse mapping)
-    fn from_text(&mut self, text: &str) {
-        // Clear grid
-        for row in &mut self.grid {
-            for cell in row {
-                *cell = ' ';
-            }
-        }
-        
-        // Place text back in grid
-        for (row_idx, line) in text.lines().enumerate() {
-            if row_idx < self.grid_height {
-                for (col_idx, ch) in line.chars().enumerate() {
-                    if col_idx < self.grid_width {
-                        self.grid[row_idx][col_idx] = ch;
-                    }
-                }
-            }
-        }
-    }
+    // Note: Removed place_element and from_text as they weren't used by hybrid approach
 }
 
 // SIMPLIFIED ALTO EDITOR
+// Consolidated viewport and performance state
+struct EditorState {
+    fake_scroll_x: f32,
+    needs_repaint: bool,
+    last_text_hash: u64,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self { fake_scroll_x: 0.0, needs_repaint: true, last_text_hash: 0 }
+    }
+}
+
 struct UnifiedAltoEditor {
     terminal_grid: TerminalGrid,
-    grid_text: String, // Current editable text
-    fake_scroll_x: f32, // Horizontal pan accumulator
-    needs_repaint: bool, // Throttle repaints
-    last_text_hash: u64, // Detect text changes
+    grid_text: String,
+    state: EditorState, // Clean consolidated state
 }
 
 impl UnifiedAltoEditor {
@@ -120,7 +94,7 @@ impl UnifiedAltoEditor {
         }
         
         // Place each line at ALTO Y position, then flow text normally on that line
-        for (line_key, mut line_elements) in lines {
+        for (_line_key, mut line_elements) in lines {
             line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
             
             if let Some(first_element) = line_elements.first() {
@@ -164,13 +138,7 @@ impl UnifiedAltoEditor {
         println!("📟 TERMINAL GRID: Placed {} elements in {}×{} grid", 
                  elements.len(), terminal_grid.grid_width, terminal_grid.grid_height);
         
-        Self { 
-            terminal_grid, 
-            grid_text, 
-            fake_scroll_x: 0.0,
-            needs_repaint: true,
-            last_text_hash: 0,
-        }
+        Self { terminal_grid, grid_text, state: EditorState::default() }
     }
     
     fn load_full_alto_page() -> Vec<UnifiedAltoElement> {
@@ -273,8 +241,8 @@ impl UnifiedAltoEditor {
         // HORIZONTAL SWIPE HACK: Only respond to horizontal scroll for left/right pan
         let mut scroll_changed = false;
         if input.raw_scroll_delta.x.abs() > input.raw_scroll_delta.y.abs() && input.raw_scroll_delta.x.abs() > 0.1 {
-            let old_scroll = self.fake_scroll_x;
-            self.fake_scroll_x += input.raw_scroll_delta.x;
+            let old_scroll = self.state.fake_scroll_x;
+            self.state.fake_scroll_x += input.raw_scroll_delta.x;
             
             // IMPROVED BOUNDS: Content width vs panel width with safety margins
             let max_line_length = self.grid_text.lines()
@@ -289,19 +257,19 @@ impl UnifiedAltoEditor {
             let min_scroll = (panel_width - content_width - margin).min(margin);
             let max_scroll = margin;
             
-            self.fake_scroll_x = self.fake_scroll_x.clamp(min_scroll, max_scroll);
-            scroll_changed = self.fake_scroll_x != old_scroll;
+            self.state.fake_scroll_x = self.state.fake_scroll_x.clamp(min_scroll, max_scroll);
+            scroll_changed = self.state.fake_scroll_x != old_scroll;
             
             if scroll_changed {
-                self.needs_repaint = true; // Only repaint when scroll actually changes
+                self.state.needs_repaint = true; // Only repaint when scroll actually changes
             }
         }
 
         // SIMPLE SCROLLABLE TERMINAL GRID: Performance optimized
-        if self.needs_repaint || scroll_changed {
+        if self.state.needs_repaint || scroll_changed {
             // Only request repaint when actually needed
             ui.ctx().request_repaint();
-            self.needs_repaint = false;
+            self.state.needs_repaint = false;
         }
         
         egui::ScrollArea::both()
@@ -316,26 +284,21 @@ impl UnifiedAltoEditor {
                 
                 // THROTTLED GRID UPDATES: Only update when text actually changes
                 if response.changed() {
-                    let new_hash = self.calculate_text_hash();
-                    if new_hash != self.last_text_hash {
-                        self.terminal_grid.from_text(&self.grid_text);
-                        self.last_text_hash = new_hash;
-                        self.needs_repaint = true;
+                    // Inline hash calculation for performance
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    self.grid_text.hash(&mut hasher);
+                    let new_hash = hasher.finish();
+                    
+                    if new_hash != self.state.last_text_hash {
+                        self.state.last_text_hash = new_hash;
+                        self.state.needs_repaint = true;
                     }
                 }
                 
                 response
             }).inner
-    }
-    
-    // PERFORMANCE: Fast text change detection
-    fn calculate_text_hash(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        let mut hasher = DefaultHasher::new();
-        self.grid_text.hash(&mut hasher);
-        hasher.finish()
     }
     
     fn export_alto_xml(&self) -> String {
@@ -388,10 +351,7 @@ impl eframe::App for AltoApp {
         let split_x = available.width() * 0.3;
         
         // Left: ALTO XML (terminal style)
-        let left_rect = egui::Rect::from_min_size(
-            available.min,
-            egui::vec2(split_x, available.height())
-        );
+        // Removed unused left_rect
         
         // DOS SPLIT SCREEN: Simple left/right division
         egui::SidePanel::left("alto_xml")
