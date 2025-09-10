@@ -45,12 +45,21 @@ impl TerminalGrid {
     }
     
     fn to_text(&self) -> String {
-        self.grid.iter()
+        let lines: Vec<String> = self.grid.iter()
             .map(|row| row.iter().collect::<String>().trim_end().to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim_end()
-            .to_string()
+            .collect();
+        
+        // Find first and last non-empty lines
+        let first_content = lines.iter().position(|line| !line.is_empty());
+        let last_content = lines.iter().rposition(|line| !line.is_empty());
+        
+        match (first_content, last_content) {
+            (Some(first), Some(last)) => {
+                // Keep everything between first and last content, INCLUDING empty lines
+                lines[first..=last].join("\n")
+            }
+            _ => String::new(),
+        }
     }
 }
 
@@ -93,24 +102,23 @@ impl UnifiedAltoEditor {
     }
     
     fn rebuild_grid(&mut self, elements: Vec<UnifiedAltoElement>) {
-        // Calculate required grid dimensions based on content
-        let mut max_col = 0;
-        let mut max_row = 0;
-        
-        // First pass: determine required size
+        // Group elements by line (similar VPOS)
         let mut lines = std::collections::BTreeMap::new();
         for element in &elements {
             let line_key = (element.vpos / 12.0) as i32;
             lines.entry(line_key).or_insert_with(Vec::new).push(element);
         }
         
-        for (_line_key, line_elements) in lines.iter() {
+        // Calculate required grid dimensions
+        let max_line_key = lines.keys().max().copied().unwrap_or(0) as usize;
+        let mut max_col = 0;
+        
+        for line_elements in lines.values() {
             let mut sorted_elements = line_elements.clone();
             sorted_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
             
             if let Some(first_element) = sorted_elements.first() {
-                let temp_grid = TerminalGrid::new(); // for coordinate calculation
-                let (start_col, row) = temp_grid.alto_to_grid(first_element.hpos, first_element.vpos);
+                let start_col = (first_element.hpos / 4.5) as usize;
                 let mut current_col = start_col;
                 
                 for (word_idx, element) in sorted_elements.iter().enumerate() {
@@ -121,55 +129,39 @@ impl UnifiedAltoEditor {
                 }
                 
                 max_col = max_col.max(current_col);
-                max_row = max_row.max(row + 5); // Add some padding
             }
         }
         
-        // Create appropriately sized grid
-        let grid_width = (max_col + 20).max(140); // Minimum 140, plus padding
-        let grid_height = (max_row + 10).max(60);  // Minimum 60, plus padding
+        // Create appropriately sized grid - use line_key directly for height
+        let grid_width = (max_col + 20).max(140);
+        let grid_height = (max_line_key + 10).max(60);
         
         self.terminal_grid = TerminalGrid::new_with_size(grid_width, grid_height);
         
-        // Group elements by line (similar VPOS)
-        let mut lines = std::collections::BTreeMap::new();
-        for element in &elements {
-            let line_key = (element.vpos / 12.0) as i32;
-            lines.entry(line_key).or_insert_with(Vec::new).push(element);
-        }
-        
-        // Place each line at ALTO Y position, then flow text normally on that line
-        for (_line_key, mut line_elements) in lines {
+        // Place text using line_key as the row position
+        for (line_key, mut line_elements) in lines {
             line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
             
+            let row = line_key as usize;
+            if row >= self.terminal_grid.grid_height {
+                continue;
+            }
+            
             if let Some(first_element) = line_elements.first() {
-                let (start_col, mut row) = self.terminal_grid.alto_to_grid(first_element.hpos, first_element.vpos);
+                let start_col = (first_element.hpos / self.terminal_grid.char_width) as usize;
                 let mut current_col = start_col;
                 
                 // Flow text naturally on this line
                 for (word_idx, element) in line_elements.iter().enumerate() {
                     // Add space between words
                     if word_idx > 0 && current_col < self.terminal_grid.grid_width {
-                        if row < self.terminal_grid.grid_height {
-                            self.terminal_grid.grid[row][current_col] = ' ';
-                            current_col += 1;
-                        }
+                        self.terminal_grid.grid[row][current_col] = ' ';
+                        current_col += 1;
                     }
                     
-                    // Check if entire word fits, if not wrap the whole word
-                    let word_len = element.content.chars().count();
-                    if current_col + word_len > self.terminal_grid.grid_width {
-                        // Wrap entire word to next line
-                        row += 1;
-                        current_col = start_col;
-                        if row >= self.terminal_grid.grid_height {
-                            break;
-                        }
-                    }
-                    
-                    // Place word characters
+                    // Place word characters (no wrapping to preserve layout)
                     for ch in element.content.chars() {
-                        if row < self.terminal_grid.grid_height && current_col < self.terminal_grid.grid_width {
+                        if current_col < self.terminal_grid.grid_width {
                             self.terminal_grid.grid[row][current_col] = ch;
                             current_col += 1;
                         }
