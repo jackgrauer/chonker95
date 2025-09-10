@@ -1,52 +1,45 @@
-// STRUCTURALLY IMPOSSIBLE TO DESYNC - Unified ALTO Editor
 use anyhow::Result;
 use eframe;
 use egui;
 
-// SINGLE SOURCE OF TRUTH - Cannot desync because there's only one data structure
 #[derive(Debug, Clone)]
 struct UnifiedAltoElement {
-    // ALTO XML data (only fields actually used)
     content: String,
     hpos: f32,
     vpos: f32,
-    // Note: id, width, height removed as they were unused
 }
 
 impl UnifiedAltoElement {
-    fn new(_id: String, content: String, hpos: f32, vpos: f32, _width: f32, _height: f32, _scale: f32) -> Self {
+    fn new(content: String, hpos: f32, vpos: f32) -> Self {
         Self { content, hpos, vpos }
     }
 }
 
-// TERMINAL GRID - Fixed character grid with ALTO spatial mapping
 struct TerminalGrid {
-    grid: Vec<Vec<char>>,         // 2D character array (like terminal buffer)
-    grid_width: usize,           // Fixed grid width (e.g., 120 columns)
-    grid_height: usize,          // Fixed grid height (e.g., 50 rows)
-    char_width: f32,             // ALTO pixels per character
-    line_height: f32,            // ALTO pixels per line
+    grid: Vec<Vec<char>>,
+    grid_width: usize,
+    grid_height: usize,
+    char_width: f32,
+    line_height: f32,
 }
 
 impl TerminalGrid {
     fn new() -> Self {
         Self {
-            grid: vec![vec![' '; 140]; 60], // Larger grid for more space
+            grid: vec![vec![' '; 140]; 60],
             grid_width: 140,
             grid_height: 60,
-            char_width: 4.5,  // Smaller units per character (more resolution)
-            line_height: 9.0, // Smaller units per line (more resolution)
+            char_width: 4.5,
+            line_height: 9.0,
         }
     }
     
-    // Map ALTO coordinates directly to grid cells
     fn alto_to_grid(&self, hpos: f32, vpos: f32) -> (usize, usize) {
         let col = (hpos / self.char_width) as usize;
         let row = (vpos / self.line_height) as usize;
         (col.min(self.grid_width - 1), row.min(self.grid_height - 1))
     }
     
-    // Convert grid to editable text (keep - used by text generation)
     fn to_text(&self) -> String {
         self.grid.iter()
             .map(|row| row.iter().collect::<String>().trim_end().to_string())
@@ -55,11 +48,8 @@ impl TerminalGrid {
             .trim_end()
             .to_string()
     }
-    // Note: Removed place_element and from_text as they weren't used by hybrid approach
 }
 
-// SIMPLIFIED ALTO EDITOR
-// Consolidated viewport and performance state
 struct EditorState {
     fake_scroll_x: f32,
     needs_repaint: bool,
@@ -75,26 +65,23 @@ impl Default for EditorState {
 struct UnifiedAltoEditor {
     terminal_grid: TerminalGrid,
     grid_text: String,
-    state: EditorState, // Clean consolidated state
+    state: EditorState,
 }
 
 impl UnifiedAltoEditor {
     fn new() -> Self {
-        // LOAD FULL PDF PAGE: Get all ALTO elements from PDF
         let elements = Self::load_full_alto_page();
         let mut terminal_grid = TerminalGrid::new();
         
-        // HYBRID APPROACH: Use ALTO for line positioning, then flow text naturally  
-        let mut lines = std::collections::BTreeMap::new();
-        
         // Group elements by line (similar VPOS)
+        let mut lines = std::collections::BTreeMap::new();
         for element in &elements {
             let line_key = (element.vpos / 12.0) as i32;
             lines.entry(line_key).or_insert_with(Vec::new).push(element);
         }
         
         // Place each line at ALTO Y position, then flow text normally on that line
-        for (_line_key, mut line_elements) in lines {
+        for (line_key, mut line_elements) in lines {
             line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
             
             if let Some(first_element) = line_elements.first() {
@@ -111,22 +98,22 @@ impl UnifiedAltoEditor {
                         }
                     }
                     
-                    // OVERFLOW HANDLING: Place word characters with wraparound
+                    // Check if entire word fits, if not wrap the whole word
+                    let word_len = element.content.chars().count();
+                    if current_col + word_len > terminal_grid.grid_width {
+                        // Wrap entire word to next line
+                        row += 1;
+                        current_col = start_col;
+                        if row >= terminal_grid.grid_height {
+                            break;
+                        }
+                    }
+                    
+                    // Place word characters
                     for ch in element.content.chars() {
-                        if row < terminal_grid.grid_height {
-                            if current_col >= terminal_grid.grid_width {
-                                // WRAP TO NEXT LINE: Don't lose content  
-                                row += 1;
-                                current_col = start_col; // Maintain indentation
-                                if row >= terminal_grid.grid_height {
-                                    println!("⚠️ OVERFLOW: Content extends beyond grid height at '{}'", element.content);
-                                    break;
-                                }
-                            }
-                            if current_col < terminal_grid.grid_width {
-                                terminal_grid.grid[row][current_col] = ch;
-                                current_col += 1;
-                            }
+                        if row < terminal_grid.grid_height && current_col < terminal_grid.grid_width {
+                            terminal_grid.grid[row][current_col] = ch;
+                            current_col += 1;
                         }
                     }
                 }
@@ -134,54 +121,31 @@ impl UnifiedAltoEditor {
         }
         
         let grid_text = terminal_grid.to_text();
-        
-        println!("📟 TERMINAL GRID: Placed {} elements in {}×{} grid", 
-                 elements.len(), terminal_grid.grid_width, terminal_grid.grid_height);
-        
         Self { terminal_grid, grid_text, state: EditorState::default() }
     }
     
     fn load_full_alto_page() -> Vec<UnifiedAltoElement> {
         // Extract all ALTO elements from PDF using our proven parsing
-        println!("📄 Loading PDF: /Users/jack/Documents/chonker_test.pdf");
         
-        match std::process::Command::new("pdfalto")
+        std::process::Command::new("pdfalto")
             .args(["-f", "1", "-l", "1", "-readingOrder", "-noImage", "-noLineNumbers",
                    "/Users/jack/Documents/chonker_test.pdf", "/dev/stdout"])
-            .output() 
-        {
-            Ok(output) if output.status.success() => {
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
                 let xml_data = String::from_utf8_lossy(&output.stdout);
-                let elements = Self::parse_alto_elements(&xml_data);
-                if elements.is_empty() {
-                    println!("⚠️ WARNING: PDF loaded but no ALTO elements found - check XML structure");
-                } else {
-                    println!("✅ SUCCESS: Loaded {} ALTO elements from PDF", elements.len());
-                }
-                elements
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                println!("❌ ERROR: pdfalto failed with exit code: {}", output.status);
-                println!("   stderr: {}", stderr);
-                println!("   Using fallback sample elements");
-                Self::create_fallback_elements()
-            }
-            Err(e) => {
-                println!("❌ ERROR: Could not execute pdfalto: {}", e);
-                println!("   Make sure pdfalto is installed and in PATH");
-                println!("   Using fallback sample elements");
-                Self::create_fallback_elements()
-            }
-        }
+                Self::parse_alto_elements(&xml_data)
+            })
+            .unwrap_or_else(Self::create_fallback_elements)
     }
     
     fn create_fallback_elements() -> Vec<UnifiedAltoElement> {
         vec![
-            UnifiedAltoElement::new("demo1".to_string(), "DEMO".to_string(), 160.8, 84.8, 30.0, 12.0, 1.0),
-            UnifiedAltoElement::new("demo2".to_string(), "ALTO".to_string(), 200.0, 84.8, 30.0, 12.0, 1.0),
-            UnifiedAltoElement::new("demo3".to_string(), "EDITOR".to_string(), 240.0, 84.8, 40.0, 12.0, 1.0),
-            UnifiedAltoElement::new("demo4".to_string(), "No PDF loaded - demo mode".to_string(), 78.6, 110.0, 200.0, 12.0, 1.0),
+            UnifiedAltoElement::new("DEMO".to_string(), 160.8, 84.8),
+            UnifiedAltoElement::new("ALTO".to_string(), 200.0, 84.8),
+            UnifiedAltoElement::new("EDITOR".to_string(), 240.0, 84.8),
+            UnifiedAltoElement::new("No PDF loaded - demo mode".to_string(), 78.6, 110.0),
         ]
     }
     
@@ -198,10 +162,7 @@ impl UnifiedAltoEditor {
                     if e.name().as_ref() == b"String" {
                         let mut content = String::new();
                         let mut hpos = 0.0;
-                        let mut vpos = 0.0; 
-                        let mut width = 0.0;
-                        let mut height = 0.0;
-                        let mut id = format!("s{}", elements.len());
+                        let mut vpos = 0.0;
                         
                         for attr in e.attributes().with_checks(false) {
                             if let Ok(attr) = attr {
@@ -212,16 +173,13 @@ impl UnifiedAltoEditor {
                                     "CONTENT" => content = value.to_string(),
                                     "HPOS" => hpos = value.parse().unwrap_or(0.0),
                                     "VPOS" => vpos = value.parse().unwrap_or(0.0),
-                                    "WIDTH" => width = value.parse().unwrap_or(0.0),
-                                    "HEIGHT" => height = value.parse().unwrap_or(0.0),
-                                    "ID" => id = value.to_string(),
                                     _ => {}
                                 }
                             }
                         }
                         
                         if !content.is_empty() {
-                            elements.push(UnifiedAltoElement::new(id, content, hpos, vpos, width, height, 1.0));
+                            elements.push(UnifiedAltoElement::new(content, hpos, vpos));
                         }
                     }
                 }
@@ -231,7 +189,6 @@ impl UnifiedAltoEditor {
             buf.clear();
         }
         
-        println!("🎯 Loaded {} ALTO elements from full PDF page", elements.len());
         elements
     }
     
@@ -274,12 +231,14 @@ impl UnifiedAltoEditor {
         
         egui::ScrollArea::both()
             .auto_shrink([false; 2])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden) // Hide scroll bars
             .show(ui, |ui| {
                 let response = ui.add_sized(
                     egui::vec2(1400.0, 800.0), // Large canvas to see full content
                     egui::TextEdit::multiline(&mut self.grid_text)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
+                        .frame(false) // Remove TextEdit frame
                 );
                 
                 // THROTTLED GRID UPDATES: Only update when text actually changes
@@ -301,93 +260,36 @@ impl UnifiedAltoEditor {
             }).inner
     }
     
-    fn export_alto_xml(&self) -> String {
-        // Generate sample ALTO XML structure for display
-        let mut xml = String::from("<?xml version=\"1.0\"?>\n<alto xmlns=\"http://www.loc.gov/standards/alto/ns-v3#\">\n<Layout>\n<Page WIDTH=\"612\" HEIGHT=\"792\">\n<PrintSpace>\n<TextBlock>\n<TextLine>\n");
-        
-        // Add first few lines of content as ALTO XML structure
-        let lines: Vec<&str> = self.grid_text.lines().take(5).collect();
-        for (i, line) in lines.iter().enumerate() {
-            let y_pos = 84.8 + (i as f32 * 24.0);
-            for (j, word) in line.split_whitespace().enumerate().take(8) {
-                let x_pos = 78.0 + (j as f32 * 60.0);
-                xml.push_str(&format!("<String ID=\"s{}{}\" CONTENT=\"{}\" HPOS=\"{:.1}\" VPOS=\"{:.1}\" WIDTH=\"50.0\" HEIGHT=\"12.0\"/>\n",
-                                      i, j, word, x_pos, y_pos));
-            }
-        }
-        
-        xml.push_str("</TextLine>\n</TextBlock>\n</PrintSpace>\n</Page>\n</Layout>\n</alto>");
-        xml
-    }
 }
 
 struct AltoApp {
     editor: UnifiedAltoEditor,
-    exported_xml: String,
 }
 
 impl Default for AltoApp {
     fn default() -> Self {
         let editor = UnifiedAltoEditor::new();
-        let exported_xml = editor.export_alto_xml();
-        Self { editor, exported_xml }
+        Self { editor }
     }
 }
 
 impl eframe::App for AltoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // DOS AESTHETIC: Terminal colors, no rounded corners
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::BLACK;
-        visuals.window_fill = egui::Color32::BLACK;
-        visuals.faint_bg_color = egui::Color32::from_gray(20);
-        visuals.extreme_bg_color = egui::Color32::from_gray(10);
-        visuals.override_text_color = Some(egui::Color32::from_rgb(0, 255, 0)); // DOS green
-        visuals.window_shadow = egui::epaint::Shadow::NONE;
+        visuals.override_text_color = Some(egui::Color32::from_rgb(0, 255, 0));
         ctx.set_visuals(visuals);
-        
-        // DOS-style split screen: No fancy panels, just raw divisions
-        let available = ctx.available_rect();
-        let split_x = available.width() * 0.3;
-        
-        // Left: ALTO XML (terminal style)
-        // Removed unused left_rect
-        
-        // DOS SPLIT SCREEN: Simple left/right division
-        egui::SidePanel::left("alto_xml")
-            .exact_width(split_x)
-            .resizable(false)
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+                ui.colored_label(egui::Color32::from_rgb(255, 255, 0), "CHONKER 9.5");
                 
-                // DOS prompt style
-                ui.colored_label(egui::Color32::from_rgb(255, 255, 0), "C:\\ALTO> ");
-                ui.separator();
-                
-                // Terminal-style XML display
-                ui.add_sized(
-                    ui.available_size(),
-                    egui::TextEdit::multiline(&mut self.exported_xml.as_str())
-                        .font(egui::TextStyle::Monospace)
-                );
+                self.editor.show(ui);
             });
-        
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-            
-            // DOS prompt style
-            ui.colored_label(egui::Color32::from_rgb(255, 255, 0), "C:\\EDIT> ");
-            ui.separator();
-            
-            // Terminal-style text editor
-            self.editor.show(ui);
-        });
     }
 }
 
 fn main() -> Result<()> {
-    println!("🚀 WYSIWYG ALTO XML Editor - Structurally Impossible to Desync!");
-    
     let app = AltoApp::default();
     
     let native_options = eframe::NativeOptions {
