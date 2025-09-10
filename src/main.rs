@@ -14,55 +14,19 @@ struct UnifiedAltoElement {
     width: f32,
     height: f32,
     
-    // Visual state (automatically derived from ALTO)
-    screen_pos: egui::Pos2,
-    screen_rect: egui::Rect,
-    
-    // Editing state (synchronized by design)
-    selected: bool,
-    editing: bool,
-    edit_buffer: String,
+    // Simplified: Only need ALTO data for quantization
 }
 
 impl UnifiedAltoElement {
-    fn new(id: String, content: String, hpos: f32, vpos: f32, width: f32, height: f32, scale: f32) -> Self {
-        let screen_pos = egui::pos2(hpos * scale, vpos * scale);
-        let screen_rect = egui::Rect::from_min_size(screen_pos, egui::vec2(width * scale, height * scale));
-        
-        Self {
-            id, content: content.clone(), hpos, vpos, width, height,
-            screen_pos, screen_rect,
-            selected: false, editing: false,
-            edit_buffer: content,
-        }
-    }
-    
-    fn update_screen_coords(&mut self, scale: f32) {
-        self.screen_pos = egui::pos2(self.hpos * scale, self.vpos * scale);
-        self.screen_rect = egui::Rect::from_min_size(self.screen_pos, egui::vec2(self.width * scale, self.height * scale));
-    }
-    
-    fn commit_edit(&mut self) {
-        self.content = self.edit_buffer.clone();
-        self.editing = false;
-        self.selected = false;
-    }
-    
-    fn start_editing(&mut self) {
-        self.editing = true;
-        self.selected = true;
-        self.edit_buffer = self.content.clone();
+    fn new(id: String, content: String, hpos: f32, vpos: f32, width: f32, height: f32, _scale: f32) -> Self {
+        Self { id, content, hpos, vpos, width, height }
     }
 }
 
 // QUANTIZED ALTO GRID - Convert ALTO to unified text grid
 struct QuantizedAltoGrid {
     grid_text: String,           // Unified text document  
-    grid_width: usize,           // Characters per line
-    grid_height: usize,          // Number of lines
-    char_width: f32,             // Pixels per character
-    line_height: f32,            // Pixels per line
-    cursor_pos: usize,           // Current editing position
+    // Simplified: Only need the text content for editing
 }
 
 impl QuantizedAltoGrid {
@@ -121,14 +85,7 @@ impl QuantizedAltoGrid {
         println!("🔚 Last 100 chars: '{}'", 
                  full_text.chars().rev().take(100).collect::<String>().chars().rev().collect::<String>());
         
-        Self {
-            grid_text: full_text,
-            grid_width: 120,
-            grid_height: 100, // Much taller for full page
-            char_width: 8.0,
-            line_height: 16.0,
-            cursor_pos: 0,
-        }
+        Self { grid_text: full_text }
     }
     
     
@@ -151,9 +108,7 @@ impl QuantizedAltoGrid {
 
 // SIMPLIFIED ALTO EDITOR
 struct UnifiedAltoEditor {
-    elements: Vec<UnifiedAltoElement>,
     quantized_grid: QuantizedAltoGrid,
-    scale: f32,
 }
 
 impl UnifiedAltoEditor {
@@ -162,7 +117,7 @@ impl UnifiedAltoEditor {
         let elements = Self::load_full_alto_page();
         let quantized_grid = QuantizedAltoGrid::from_alto_elements(&elements);
         
-        Self { elements, quantized_grid, scale: 1.5 }
+        Self { quantized_grid }
     }
     
     fn load_full_alto_page() -> Vec<UnifiedAltoElement> {
@@ -243,18 +198,8 @@ impl UnifiedAltoEditor {
     }
     
     fn export_alto_xml(&self) -> String {
-        let mut xml = String::new();
-        xml.push_str("<?xml version=\"1.0\"?>\n<alto>\n<Layout><Page>\n");
-        xml.push_str("<TextBlock ID=\"title\" HPOS=\"160.8\" VPOS=\"84.8\">\n");
-        xml.push_str("<TextLine ID=\"title_line\">\n");
-        
-        for element in &self.elements {
-            xml.push_str(&format!("  <String ID=\"{}\" CONTENT=\"{}\" HPOS=\"{:.1}\" VPOS=\"{:.1}\" WIDTH=\"{:.1}\" HEIGHT=\"{:.1}\"/>\n",
-                                  element.id, element.content, element.hpos, element.vpos, element.width, element.height));
-        }
-        
-        xml.push_str("</TextLine>\n</TextBlock>\n</Page>\n</Layout>\n</alto>");
-        xml
+        // Simple XML export (could be enhanced to reconstruct from text)
+        format!("<!-- Edited ALTO text -->\n{}", self.quantized_grid.grid_text)
     }
 }
 
