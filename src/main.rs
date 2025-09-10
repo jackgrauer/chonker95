@@ -25,10 +25,14 @@ struct TerminalGrid {
 
 impl TerminalGrid {
     fn new() -> Self {
+        Self::new_with_size(140, 60)
+    }
+    
+    fn new_with_size(width: usize, height: usize) -> Self {
         Self {
-            grid: vec![vec![' '; 140]; 60],
-            grid_width: 140,
-            grid_height: 60,
+            grid: vec![vec![' '; width]; height],
+            grid_width: width,
+            grid_height: height,
             char_width: 4.5,
             line_height: 9.0,
         }
@@ -54,11 +58,19 @@ struct EditorState {
     fake_scroll_x: f32,
     needs_repaint: bool,
     last_text_hash: u64,
+    current_page: u32,
+    total_pages: u32,
 }
 
 impl Default for EditorState {
     fn default() -> Self {
-        Self { fake_scroll_x: 0.0, needs_repaint: true, last_text_hash: 0 }
+        Self { 
+            fake_scroll_x: 0.0, 
+            needs_repaint: true, 
+            last_text_hash: 0,
+            current_page: 1,
+            total_pages: 2,
+        }
     }
 }
 
@@ -70,8 +82,54 @@ struct UnifiedAltoEditor {
 
 impl UnifiedAltoEditor {
     fn new() -> Self {
-        let elements = Self::load_full_alto_page();
-        let mut terminal_grid = TerminalGrid::new();
+        let elements = Self::load_alto_page(1);
+        let mut editor = Self { 
+            terminal_grid: TerminalGrid::new(), 
+            grid_text: String::new(), 
+            state: EditorState::default() 
+        };
+        editor.rebuild_grid(elements);
+        editor
+    }
+    
+    fn rebuild_grid(&mut self, elements: Vec<UnifiedAltoElement>) {
+        // Calculate required grid dimensions based on content
+        let mut max_col = 0;
+        let mut max_row = 0;
+        
+        // First pass: determine required size
+        let mut lines = std::collections::BTreeMap::new();
+        for element in &elements {
+            let line_key = (element.vpos / 12.0) as i32;
+            lines.entry(line_key).or_insert_with(Vec::new).push(element);
+        }
+        
+        for (_line_key, line_elements) in lines.iter() {
+            let mut sorted_elements = line_elements.clone();
+            sorted_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
+            
+            if let Some(first_element) = sorted_elements.first() {
+                let temp_grid = TerminalGrid::new(); // for coordinate calculation
+                let (start_col, row) = temp_grid.alto_to_grid(first_element.hpos, first_element.vpos);
+                let mut current_col = start_col;
+                
+                for (word_idx, element) in sorted_elements.iter().enumerate() {
+                    if word_idx > 0 {
+                        current_col += 1; // space
+                    }
+                    current_col += element.content.chars().count();
+                }
+                
+                max_col = max_col.max(current_col);
+                max_row = max_row.max(row + 5); // Add some padding
+            }
+        }
+        
+        // Create appropriately sized grid
+        let grid_width = (max_col + 20).max(140); // Minimum 140, plus padding
+        let grid_height = (max_row + 10).max(60);  // Minimum 60, plus padding
+        
+        self.terminal_grid = TerminalGrid::new_with_size(grid_width, grid_height);
         
         // Group elements by line (similar VPOS)
         let mut lines = std::collections::BTreeMap::new();
@@ -81,38 +139,38 @@ impl UnifiedAltoEditor {
         }
         
         // Place each line at ALTO Y position, then flow text normally on that line
-        for (line_key, mut line_elements) in lines {
+        for (_line_key, mut line_elements) in lines {
             line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
             
             if let Some(first_element) = line_elements.first() {
-                let (start_col, mut row) = terminal_grid.alto_to_grid(first_element.hpos, first_element.vpos);
+                let (start_col, mut row) = self.terminal_grid.alto_to_grid(first_element.hpos, first_element.vpos);
                 let mut current_col = start_col;
                 
                 // Flow text naturally on this line
                 for (word_idx, element) in line_elements.iter().enumerate() {
                     // Add space between words
-                    if word_idx > 0 && current_col < terminal_grid.grid_width {
-                        if row < terminal_grid.grid_height {
-                            terminal_grid.grid[row][current_col] = ' ';
+                    if word_idx > 0 && current_col < self.terminal_grid.grid_width {
+                        if row < self.terminal_grid.grid_height {
+                            self.terminal_grid.grid[row][current_col] = ' ';
                             current_col += 1;
                         }
                     }
                     
                     // Check if entire word fits, if not wrap the whole word
                     let word_len = element.content.chars().count();
-                    if current_col + word_len > terminal_grid.grid_width {
+                    if current_col + word_len > self.terminal_grid.grid_width {
                         // Wrap entire word to next line
                         row += 1;
                         current_col = start_col;
-                        if row >= terminal_grid.grid_height {
+                        if row >= self.terminal_grid.grid_height {
                             break;
                         }
                     }
                     
                     // Place word characters
                     for ch in element.content.chars() {
-                        if row < terminal_grid.grid_height && current_col < terminal_grid.grid_width {
-                            terminal_grid.grid[row][current_col] = ch;
+                        if row < self.terminal_grid.grid_height && current_col < self.terminal_grid.grid_width {
+                            self.terminal_grid.grid[row][current_col] = ch;
                             current_col += 1;
                         }
                     }
@@ -120,15 +178,20 @@ impl UnifiedAltoEditor {
             }
         }
         
-        let grid_text = terminal_grid.to_text();
-        Self { terminal_grid, grid_text, state: EditorState::default() }
+        self.grid_text = self.terminal_grid.to_text();
     }
     
-    fn load_full_alto_page() -> Vec<UnifiedAltoElement> {
+    fn load_page(&mut self, page: u32) {
+        self.state.current_page = page;
+        let elements = Self::load_alto_page(page);
+        self.rebuild_grid(elements);
+    }
+    
+    fn load_alto_page(page: u32) -> Vec<UnifiedAltoElement> {
         // Extract all ALTO elements from PDF using our proven parsing
         
         std::process::Command::new("pdfalto")
-            .args(["-f", "1", "-l", "1", "-readingOrder", "-noImage", "-noLineNumbers",
+            .args(["-f", &page.to_string(), "-l", &page.to_string(), "-readingOrder", "-noImage", "-noLineNumbers",
                    "/Users/jack/Documents/chonker_test.pdf", "/dev/stdout"])
             .output()
             .ok()
@@ -195,6 +258,7 @@ impl UnifiedAltoEditor {
     fn show(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let input = ui.input(|i| i.clone());
 
+
         // HORIZONTAL SWIPE HACK: Only respond to horizontal scroll for left/right pan
         let mut scroll_changed = false;
         if input.raw_scroll_delta.x.abs() > input.raw_scroll_delta.y.abs() && input.raw_scroll_delta.x.abs() > 0.1 {
@@ -233,12 +297,18 @@ impl UnifiedAltoEditor {
             .auto_shrink([false; 2])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden) // Hide scroll bars
             .show(ui, |ui| {
+                // Calculate size based on grid dimensions
+                let char_width = 7.2; // Monospace character width
+                let line_height = 14.0; // Line height
+                let content_width = self.terminal_grid.grid_width as f32 * char_width;
+                let content_height = self.terminal_grid.grid_height as f32 * line_height;
+                
                 let response = ui.add_sized(
-                    egui::vec2(1400.0, 800.0), // Large canvas to see full content
+                    egui::vec2(content_width, content_height),
                     egui::TextEdit::multiline(&mut self.grid_text)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
-                        .frame(false) // Remove TextEdit frame
+                        .frame(false)
                 );
                 
                 // THROTTLED GRID UPDATES: Only update when text actually changes
@@ -282,7 +352,18 @@ impl eframe::App for AltoApp {
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-                ui.colored_label(egui::Color32::from_rgb(255, 255, 0), "CHONKER 9.5");
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(255, 255, 0), "CHONKER 9.5");
+                    ui.separator();
+                    if ui.button("◀").clicked() && self.editor.state.current_page > 1 {
+                        self.editor.load_page(self.editor.state.current_page - 1);
+                    }
+                    ui.colored_label(egui::Color32::from_rgb(255, 255, 0), 
+                                   format!("{}/{}", self.editor.state.current_page, self.editor.state.total_pages));
+                    if ui.button("▶").clicked() && self.editor.state.current_page < self.editor.state.total_pages {
+                        self.editor.load_page(self.editor.state.current_page + 1);
+                    }
+                });
                 
                 self.editor.show(ui);
             });
