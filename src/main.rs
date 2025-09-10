@@ -99,6 +99,9 @@ impl TerminalGrid {
 struct UnifiedAltoEditor {
     terminal_grid: TerminalGrid,
     grid_text: String, // Current editable text
+    fake_scroll_x: f32, // Horizontal pan accumulator
+    needs_repaint: bool, // Throttle repaints
+    last_text_hash: u64, // Detect text changes
 }
 
 impl UnifiedAltoEditor {
@@ -121,22 +124,35 @@ impl UnifiedAltoEditor {
             line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
             
             if let Some(first_element) = line_elements.first() {
-                let (start_col, row) = terminal_grid.alto_to_grid(first_element.hpos, first_element.vpos);
+                let (start_col, mut row) = terminal_grid.alto_to_grid(first_element.hpos, first_element.vpos);
                 let mut current_col = start_col;
                 
                 // Flow text naturally on this line
                 for (word_idx, element) in line_elements.iter().enumerate() {
                     // Add space between words
                     if word_idx > 0 && current_col < terminal_grid.grid_width {
-                        terminal_grid.grid[row][current_col] = ' ';
-                        current_col += 1;
+                        if row < terminal_grid.grid_height {
+                            terminal_grid.grid[row][current_col] = ' ';
+                            current_col += 1;
+                        }
                     }
                     
-                    // Place word characters sequentially
+                    // OVERFLOW HANDLING: Place word characters with wraparound
                     for ch in element.content.chars() {
-                        if current_col < terminal_grid.grid_width && row < terminal_grid.grid_height {
-                            terminal_grid.grid[row][current_col] = ch;
-                            current_col += 1;
+                        if row < terminal_grid.grid_height {
+                            if current_col >= terminal_grid.grid_width {
+                                // WRAP TO NEXT LINE: Don't lose content  
+                                row += 1;
+                                current_col = start_col; // Maintain indentation
+                                if row >= terminal_grid.grid_height {
+                                    println!("⚠️ OVERFLOW: Content extends beyond grid height at '{}'", element.content);
+                                    break;
+                                }
+                            }
+                            if current_col < terminal_grid.grid_width {
+                                terminal_grid.grid[row][current_col] = ch;
+                                current_col += 1;
+                            }
                         }
                     }
                 }
@@ -148,11 +164,19 @@ impl UnifiedAltoEditor {
         println!("📟 TERMINAL GRID: Placed {} elements in {}×{} grid", 
                  elements.len(), terminal_grid.grid_width, terminal_grid.grid_height);
         
-        Self { terminal_grid, grid_text }
+        Self { 
+            terminal_grid, 
+            grid_text, 
+            fake_scroll_x: 0.0,
+            needs_repaint: true,
+            last_text_hash: 0,
+        }
     }
     
     fn load_full_alto_page() -> Vec<UnifiedAltoElement> {
         // Extract all ALTO elements from PDF using our proven parsing
+        println!("📄 Loading PDF: /Users/jack/Documents/chonker_test.pdf");
+        
         match std::process::Command::new("pdfalto")
             .args(["-f", "1", "-l", "1", "-readingOrder", "-noImage", "-noLineNumbers",
                    "/Users/jack/Documents/chonker_test.pdf", "/dev/stdout"])
@@ -160,17 +184,37 @@ impl UnifiedAltoEditor {
         {
             Ok(output) if output.status.success() => {
                 let xml_data = String::from_utf8_lossy(&output.stdout);
-                Self::parse_alto_elements(&xml_data)
+                let elements = Self::parse_alto_elements(&xml_data);
+                if elements.is_empty() {
+                    println!("⚠️ WARNING: PDF loaded but no ALTO elements found - check XML structure");
+                } else {
+                    println!("✅ SUCCESS: Loaded {} ALTO elements from PDF", elements.len());
+                }
+                elements
             }
-            _ => {
-                // Fallback to sample elements if PDF loading fails
-                vec![
-                    UnifiedAltoElement::new("s1".to_string(), "CITY".to_string(), 160.8, 84.8, 26.4, 10.6, 1.0),
-                    UnifiedAltoElement::new("s2".to_string(), "CASH".to_string(), 189.8, 84.8, 29.3, 10.6, 1.0),
-                    UnifiedAltoElement::new("s3".to_string(), "MANAGEMENT".to_string(), 221.8, 84.8, 79.8, 10.6, 1.0),
-                ]
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                println!("❌ ERROR: pdfalto failed with exit code: {}", output.status);
+                println!("   stderr: {}", stderr);
+                println!("   Using fallback sample elements");
+                Self::create_fallback_elements()
+            }
+            Err(e) => {
+                println!("❌ ERROR: Could not execute pdfalto: {}", e);
+                println!("   Make sure pdfalto is installed and in PATH");
+                println!("   Using fallback sample elements");
+                Self::create_fallback_elements()
             }
         }
+    }
+    
+    fn create_fallback_elements() -> Vec<UnifiedAltoElement> {
+        vec![
+            UnifiedAltoElement::new("demo1".to_string(), "DEMO".to_string(), 160.8, 84.8, 30.0, 12.0, 1.0),
+            UnifiedAltoElement::new("demo2".to_string(), "ALTO".to_string(), 200.0, 84.8, 30.0, 12.0, 1.0),
+            UnifiedAltoElement::new("demo3".to_string(), "EDITOR".to_string(), 240.0, 84.8, 40.0, 12.0, 1.0),
+            UnifiedAltoElement::new("demo4".to_string(), "No PDF loaded - demo mode".to_string(), 78.6, 110.0, 200.0, 12.0, 1.0),
+        ]
     }
     
     fn parse_alto_elements(xml: &str) -> Vec<UnifiedAltoElement> {
@@ -224,20 +268,74 @@ impl UnifiedAltoEditor {
     }
     
     fn show(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        // TERMINAL GRID EDITOR: Fixed grid with ALTO spatial awareness
-        let response = ui.add_sized(
-            ui.available_size(),
-            egui::TextEdit::multiline(&mut self.grid_text)
-                .font(egui::TextStyle::Monospace)
-                .desired_width(f32::INFINITY)
-        );
-        
-        // Sync: Update terminal grid when text is edited
-        if response.changed() {
-            self.terminal_grid.from_text(&self.grid_text);
+        let input = ui.input(|i| i.clone());
+
+        // HORIZONTAL SWIPE HACK: Only respond to horizontal scroll for left/right pan
+        let mut scroll_changed = false;
+        if input.raw_scroll_delta.x.abs() > input.raw_scroll_delta.y.abs() && input.raw_scroll_delta.x.abs() > 0.1 {
+            let old_scroll = self.fake_scroll_x;
+            self.fake_scroll_x += input.raw_scroll_delta.x;
+            
+            // IMPROVED BOUNDS: Content width vs panel width with safety margins
+            let max_line_length = self.grid_text.lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(140) as f32;
+            let panel_width = ui.available_width();
+            let content_width = max_line_length * 7.2; // Accurate character width
+            
+            // CLAMP WITH MARGINS: Prevent infinite pan but allow some overscroll
+            let margin = 50.0;
+            let min_scroll = (panel_width - content_width - margin).min(margin);
+            let max_scroll = margin;
+            
+            self.fake_scroll_x = self.fake_scroll_x.clamp(min_scroll, max_scroll);
+            scroll_changed = self.fake_scroll_x != old_scroll;
+            
+            if scroll_changed {
+                self.needs_repaint = true; // Only repaint when scroll actually changes
+            }
+        }
+
+        // SIMPLE SCROLLABLE TERMINAL GRID: Performance optimized
+        if self.needs_repaint || scroll_changed {
+            // Only request repaint when actually needed
+            ui.ctx().request_repaint();
+            self.needs_repaint = false;
         }
         
-        response
+        egui::ScrollArea::both()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let response = ui.add_sized(
+                    egui::vec2(1400.0, 800.0), // Large canvas to see full content
+                    egui::TextEdit::multiline(&mut self.grid_text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                );
+                
+                // THROTTLED GRID UPDATES: Only update when text actually changes
+                if response.changed() {
+                    let new_hash = self.calculate_text_hash();
+                    if new_hash != self.last_text_hash {
+                        self.terminal_grid.from_text(&self.grid_text);
+                        self.last_text_hash = new_hash;
+                        self.needs_repaint = true;
+                    }
+                }
+                
+                response
+            }).inner
+    }
+    
+    // PERFORMANCE: Fast text change detection
+    fn calculate_text_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        self.grid_text.hash(&mut hasher);
+        hasher.finish()
     }
     
     fn export_alto_xml(&self) -> String {
