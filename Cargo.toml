@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.99"
-eframe = "0.32.2"
-egui = "0.32.2"
-image = "0.25.2"
-quick-xml = "0.38.3"
-rfd = "0.15.4"
-ropey = "1.6.1"
+eframe = { version = "0.32.2", default-features = false, features = ["glow", "default_fonts"] }
+egui = { version = "0.32.2", default-features = false }
+image = { version = "0.25.2", default-features = false, features = ["png"] }
+quick-xml = { version = "0.38.3", default-features = false }
+rfd = { version = "0.15.4", default-features = false }
+ropey = { version = "1.6.1", default-features = false }

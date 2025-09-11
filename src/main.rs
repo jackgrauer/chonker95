@@ -1,6 +1,4 @@
 use anyhow::Result;
-use eframe;
-use egui;
 use ropey::Rope;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -104,7 +102,7 @@ impl UnifiedAltoEditor {
         
         lines_map.into_iter()
             .map(|(_, mut words)| {
-                words.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
+                words.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap_or(std::cmp::Ordering::Equal));
                 let avg_vpos = words.iter().map(|w| w.vpos).sum::<f32>() / words.len() as f32;
                 Line {
                     words,
@@ -206,7 +204,7 @@ impl UnifiedAltoEditor {
         
         if !lines.is_empty() {
             // Sort lines by their vertical position
-            lines.sort_by(|a, b| a.avg_vpos.partial_cmp(&b.avg_vpos).unwrap());
+            lines.sort_by(|a, b| a.avg_vpos.partial_cmp(&b.avg_vpos).unwrap_or(std::cmp::Ordering::Equal));
             
             let mut last_vpos = lines[0].avg_vpos;
             
