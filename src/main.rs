@@ -2,6 +2,7 @@ use anyhow::Result;
 use eframe;
 use egui;
 use ropey::Rope;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -31,60 +32,12 @@ impl UnifiedAltoElement {
     }
 }
 
-struct TerminalGrid {
-    grid: Vec<Vec<char>>,
-    grid_width: usize,
-    grid_height: usize,
-    char_width: f32,
-    line_height: f32,
-}
-
-impl TerminalGrid {
-    fn new() -> Self {
-        Self::new_with_size(140, 60)
-    }
-    
-    fn new_with_size(width: usize, height: usize) -> Self {
-        Self {
-            grid: vec![vec![' '; width]; height],
-            grid_width: width,
-            grid_height: height,
-            char_width: 4.5,
-            line_height: 9.0,
-        }
-    }
-    
-    fn alto_to_grid(&self, hpos: f32, vpos: f32) -> (usize, usize) {
-        let col = (hpos / self.char_width) as usize;
-        let row = (vpos / self.line_height) as usize;
-        (col.min(self.grid_width - 1), row.min(self.grid_height - 1))
-    }
-    
-    fn to_text(&self) -> String {
-        let lines: Vec<String> = self.grid.iter()
-            .map(|row| row.iter().collect::<String>().trim_end().to_string())
-            .collect();
-        
-        // Find first and last non-empty lines
-        let first_content = lines.iter().position(|line| !line.is_empty());
-        let last_content = lines.iter().rposition(|line| !line.is_empty());
-        
-        match (first_content, last_content) {
-            (Some(first), Some(last)) => {
-                // Keep everything between first and last content, INCLUDING empty lines
-                lines[first..=last].join("\n")
-            }
-            _ => String::new(),
-        }
-    }
-}
 
 struct EditorState {
     fake_scroll_x: f32,
     needs_repaint: bool,
     last_text_hash: u64,
     current_page: u32,
-    total_pages: u32,
 }
 
 impl Default for EditorState {
@@ -94,13 +47,11 @@ impl Default for EditorState {
             needs_repaint: true, 
             last_text_hash: 0,
             current_page: 1,
-            total_pages: 2,
         }
     }
 }
 
 struct UnifiedAltoEditor {
-    terminal_grid: TerminalGrid,
     grid_rope: Rope,
     grid_text_cache: Option<String>,
     rope_dirty: bool,
@@ -110,7 +61,6 @@ struct UnifiedAltoEditor {
 impl UnifiedAltoEditor {
     fn new() -> Self {
         let mut editor = Self { 
-            terminal_grid: TerminalGrid::new(), 
             grid_rope: Rope::new(),
             grid_text_cache: None,
             rope_dirty: true,
@@ -285,13 +235,6 @@ impl UnifiedAltoEditor {
         self.rope_dirty = true;
     }
     
-    fn load_page(&mut self, page: u32) {
-        self.state.current_page = page;
-        // This method is kept for backward compatibility but should not be used
-        // when a specific PDF path is available
-        let elements = Self::create_fallback_elements();
-        self.rebuild_grid(elements);
-    }
     
     fn load_page_from_pdf(&mut self, pdf_path: &str, page: u32) {
         self.state.current_page = page;
@@ -409,11 +352,16 @@ impl UnifiedAltoEditor {
             .auto_shrink([false; 2])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden) // Hide scroll bars
             .show(ui, |ui| {
-                // Calculate size based on grid dimensions
+                // Calculate size based on content
                 let char_width = 7.2; // Monospace character width
                 let line_height = 14.0; // Line height
-                let content_width = self.terminal_grid.grid_width as f32 * char_width;
-                let content_height = self.terminal_grid.grid_height as f32 * line_height;
+                let max_line_length = self.grid_rope.lines()
+                    .map(|line| line.len_chars())
+                    .max()
+                    .unwrap_or(140) as f32;
+                let line_count = self.grid_rope.lines().count() as f32;
+                let content_width = max_line_length * char_width;
+                let content_height = line_count * line_height;
                 
                 // Dramatically extend content width to prevent wrapping when zoomed
                 let extended_width = content_width * 5.0; // Much wider to handle zoom
@@ -461,6 +409,8 @@ struct AltoApp {
     pdf_path: Option<PathBuf>,
     current_page: usize,
     total_pages: usize,
+    // Performance caching
+    page_cache: std::collections::HashMap<usize, egui::TextureHandle>,
     // UI state
     show_pdf_panel: bool,
     zoom_level: f32,
@@ -474,6 +424,7 @@ impl Default for AltoApp {
             pdf_path: None,
             current_page: 1,
             total_pages: 0,
+            page_cache: HashMap::new(),
             show_pdf_panel: false,  // Hidden by default
             zoom_level: 2.0,
         }
@@ -484,6 +435,7 @@ impl AltoApp {
     fn open_pdf(&mut self, path: PathBuf) {
         self.pdf_path = Some(path.clone());
         self.current_page = 1;
+        self.page_cache.clear();  // Clear cache for new PDF
         
         // Get total page count using pdfinfo
         if let Ok(output) = std::process::Command::new("pdfinfo")
@@ -517,27 +469,35 @@ impl AltoApp {
         }
     }
     
-    fn render_pdf_page(&mut self, ctx: &egui::Context, page: usize) -> Option<egui::TextureHandle> {
-        // No caching - generate fresh each time for better performance debugging
+    fn render_pdf_page(&mut self, ctx: &egui::Context, page: usize) -> Option<&egui::TextureHandle> {
+        // Check cache first for major performance boost
+        if self.page_cache.contains_key(&page) {
+            return self.page_cache.get(&page);
+        }
+        
+        // Only render if PDF panel is visible (conditional rendering)
+        if !self.show_pdf_panel {
+            return None;
+        }
         
         let pdf_path = self.pdf_path.as_ref()?;
         let temp_file = format!("/tmp/chonker_page_{}", page);
         
-        // Calculate scaled size based on zoom level (much smaller for performance)
-        let base_width = 400.0;  // Reduced for performance
+        // Calculate scaled size (reduced for performance)
+        let base_width = 300.0;  // Smaller for speed
         let scaled_width = (base_width * self.zoom_level) as u32;
         
-        // Use pdftoppm to render the page
-        let result = std::process::Command::new("pdftoppm")
+        // Use ghostscript for faster rendering
+        let result = std::process::Command::new("gs")
             .args([
-                "-f", &page.to_string(),
-                "-l", &page.to_string(),
-                "-png",
-                "-scale-to-x", &scaled_width.to_string(),
-                "-scale-to-y", "-1",  // Maintain aspect ratio
+                "-dNOPAUSE", "-dBATCH", "-dSAFER",
+                "-sDEVICE=png16m",
+                &format!("-dFirstPage={}", page),
+                &format!("-dLastPage={}", page),
+                &format!("-r{}", (72.0 * scaled_width as f32 / 612.0) as u32), // Calculate DPI
+                &format!("-sOutputFile={}-{:02}.png", temp_file, page),
             ])
             .arg(pdf_path)
-            .arg(&temp_file)
             .output();
             
         match result {
@@ -587,7 +547,9 @@ impl AltoApp {
             // Clean up temp file immediately
             let _ = std::fs::remove_file(&image_path);
             
-            return Some(texture);
+            // Cache the texture for future use
+            self.page_cache.insert(page, texture);
+            return self.page_cache.get(&page);
         } else {
             println!("DEBUG: Failed to open image file: {}", image_path);
         }
@@ -611,7 +573,7 @@ impl AltoApp {
             let scroll_response = scroll_area.show(ui, |ui| {
                 ui.add_sized(
                     display_size,
-                    egui::Image::new(&texture)
+                    egui::Image::new(texture)
                         .bg_fill(egui::Color32::BLACK)
                         .sense(egui::Sense::drag())
                 )
@@ -651,12 +613,15 @@ impl eframe::App for AltoApp {
                 if i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus) {
                     // Zoom in (faster steps)
                     self.zoom_level = (self.zoom_level * 1.5).min(5.0);
+                    self.page_cache.clear();  // Clear cache on zoom change
                 } else if i.key_pressed(egui::Key::Minus) {
                     // Zoom out (faster steps)
                     self.zoom_level = (self.zoom_level / 1.5).max(0.3);
+                    self.page_cache.clear();  // Clear cache on zoom change
                 } else if i.key_pressed(egui::Key::Num0) {
                     // Reset zoom
                     self.zoom_level = 2.0;
+                    self.page_cache.clear();  // Clear cache on zoom reset
                 }
             }
             
