@@ -195,9 +195,33 @@ impl UnifiedAltoEditor {
         }
     }
     
-    // Step 4: Formatter Behavior
+    // Step 4: Formatter Behavior with center-alignment detection
     fn format_line(&self, line: &Line) -> String {
-        if !line.is_table {
+        if line.words.is_empty() {
+            return String::new();
+        }
+        
+        // Check if this line is centered (starts around middle of page)
+        let first_word_hpos = line.words[0].hpos;
+        let page_width = 612.0; // Standard PDF page width
+        let is_centered = first_word_hpos > (page_width * 0.25) && first_word_hpos < (page_width * 0.75);
+        
+        // Check if it's a title-like line (short, likely all caps or title case)
+        let total_chars: usize = line.words.iter().map(|w| w.content.len()).sum();
+        let is_likely_title = total_chars < 80 && line.words.len() < 8;
+        
+        if is_centered && is_likely_title {
+            // Center-align titles and headers
+            let text = line.words.iter().map(|w| w.content.as_str()).collect::<Vec<_>>().join(" ");
+            let terminal_width = 80; // Assume 80-char terminal width
+            let text_len = text.len();
+            if text_len < terminal_width {
+                let padding = (terminal_width - text_len) / 2;
+                format!("{}{}", " ".repeat(padding), text)
+            } else {
+                text
+            }
+        } else if !line.is_table {
             // Paragraph mode: natural spacing
             line.words.iter().map(|w| w.content.as_str()).collect::<Vec<_>>().join(" ")
         } else {
@@ -437,7 +461,8 @@ struct AltoApp {
     pdf_path: Option<PathBuf>,
     current_page: usize,
     total_pages: usize,
-    // Zoom state
+    // UI state
+    show_pdf_panel: bool,
     zoom_level: f32,
 }
 
@@ -449,6 +474,7 @@ impl Default for AltoApp {
             pdf_path: None,
             current_page: 1,
             total_pages: 0,
+            show_pdf_panel: false,  // Hidden by default
             zoom_level: 2.0,
         }
     }
@@ -668,6 +694,14 @@ impl eframe::App for AltoApp {
                 
                 ui.separator();
                 
+                // PDF panel toggle button
+                let panel_text = if self.show_pdf_panel { "🖼️ Hide PDF" } else { "🖼️ Show PDF" };
+                if ui.button(panel_text).clicked() {
+                    self.show_pdf_panel = !self.show_pdf_panel;
+                }
+                
+                ui.separator();
+                
                 // Show current PDF info if loaded
                 if let Some(path) = &self.pdf_path {
                     if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
@@ -705,31 +739,33 @@ impl eframe::App for AltoApp {
             });
         });
         
-        // Left side panel for PDF display
-        egui::SidePanel::left("pdf_panel")
-            .min_width(600.0)
-            .default_width(800.0)
-            .frame(egui::Frame::default().fill(egui::Color32::BLACK))
-            .show(ctx, |ui| {
-                if self.pdf_path.is_some() {
-                    self.show_pdf_page(ui, ctx);
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(50.0);
-                            ui.colored_label(
-                                egui::Color32::from_rgb(140, 140, 140),
-                                "Click 'Open PDF' to load a document"
-                            );
-                            ui.add_space(20.0);
-                            ui.colored_label(
-                                egui::Color32::from_rgb(120, 120, 120),
-                                "PDF will appear here when loaded"
-                            );
+        // Left side panel for PDF display (conditional)
+        if self.show_pdf_panel {
+            egui::SidePanel::left("pdf_panel")
+                .min_width(600.0)
+                .default_width(800.0)
+                .frame(egui::Frame::default().fill(egui::Color32::BLACK))
+                .show(ctx, |ui| {
+                    if self.pdf_path.is_some() {
+                        self.show_pdf_page(ui, ctx);
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(50.0);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(140, 140, 140),
+                                    "Click 'Open PDF' to load a document"
+                                );
+                                ui.add_space(20.0);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(120, 120, 120),
+                                    "PDF will appear here when loaded"
+                                );
+                            });
                         });
-                    });
-                }
-            });
+                    }
+                });
+        }
         
         // Central panel for text editor
         egui::CentralPanel::default()
