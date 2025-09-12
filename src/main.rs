@@ -1708,40 +1708,65 @@ impl WysiwygEditor {
     }
     
     fn replace_selection_with_text(&mut self, new_text: &str) -> Result<()> {
-        // First delete the selected area
-        self.delete_selection()?;
-        
-        // Then insert the new table at cursor position
         let table_lines: Vec<&str> = new_text.lines().collect();
         let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
         
-        // Ensure we have enough lines
-        while lines.len() <= (self.cursor_y as usize + table_lines.len()) {
-            lines.push(String::new());
+        // Get selection bounds
+        let (start_y, end_y) = if self.selection_start_y <= self.selection_end_y {
+            (self.selection_start_y, self.selection_end_y)
+        } else {
+            (self.selection_end_y, self.selection_start_y)
+        };
+        
+        let start_x = if self.selection_start_x <= self.selection_end_x {
+            self.selection_start_x
+        } else {
+            self.selection_end_x
+        };
+        
+        // Calculate how many extra lines we need
+        let selected_height = (end_y - start_y + 1) as usize;
+        let table_height = table_lines.len();
+        let extra_lines_needed = if table_height > selected_height {
+            table_height - selected_height
+        } else {
+            0
+        };
+        
+        // Make room by inserting blank lines if needed
+        if extra_lines_needed > 0 {
+            let insert_at = (end_y + 1) as usize;
+            for _ in 0..extra_lines_needed {
+                if insert_at <= lines.len() {
+                    lines.insert(insert_at, String::new());
+                } else {
+                    lines.push(String::new());
+                }
+            }
         }
         
-        // Insert table lines
+        // Now replace the selected area with table content
         for (i, table_line) in table_lines.iter().enumerate() {
-            let target_y = self.cursor_y as usize + i;
+            let target_y = (start_y as usize) + i;
             if target_y < lines.len() {
                 let line = &mut lines[target_y];
                 let mut line_chars: Vec<char> = line.chars().collect();
                 
-                // Extend line with spaces if cursor is beyond current text
-                while line_chars.len() < self.cursor_x as usize {
+                // Extend line with spaces if needed
+                while line_chars.len() < start_x as usize {
                     line_chars.push(' ');
                 }
                 
-                // Replace text starting at cursor position
-                let start_pos = self.cursor_x as usize;
+                // Clear the original selection area and insert table content
                 let table_chars: Vec<char> = table_line.chars().collect();
+                let start_pos = start_x as usize;
                 
-                // Ensure line is long enough
+                // Ensure line is long enough for the table
                 while line_chars.len() < start_pos + table_chars.len() {
                     line_chars.push(' ');
                 }
                 
-                // Replace characters
+                // Replace the content at the original selection position
                 for (j, &ch) in table_chars.iter().enumerate() {
                     line_chars[start_pos + j] = ch;
                 }
