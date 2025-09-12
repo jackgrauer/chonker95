@@ -27,6 +27,12 @@ enum ActivePane {
     Text,   // Right pane - text editing
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LayoutMode {
+    Spatial,    // Perfect tables, some word spacing issues
+    Sequential, // Perfect text flow, table alignment issues
+}
+
 #[derive(Debug, Clone)]
 struct AltoElement {
     _id: String,
@@ -38,12 +44,27 @@ struct AltoElement {
     // Screen position (calculated from PDF coordinates)
     _screen_x: u16,
     _screen_y: u16,
+    element_type: ElementType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ElementType {
+    Text,
+    Space,
 }
 
 impl AltoElement {
     fn new(id: String, content: String, hpos: f32, vpos: f32, width: f32, height: f32) -> Self {
-        let screen_x = (hpos / 8.0) as u16; // Convert PDF coords to terminal coords
-        let screen_y = (vpos / 12.0) as u16;
+        // Improved coordinate mapping - preserve relative positioning
+        // Use page-relative coordinates instead of fixed division
+        let screen_x = (hpos * 0.1) as u16; // Better scaling factor
+        let screen_y = (vpos * 0.08) as u16; // Preserve vertical relationships
+        
+        let element_type = if content == " " {
+            ElementType::Space
+        } else {
+            ElementType::Text
+        };
         
         Self {
             _id: id,
@@ -54,6 +75,7 @@ impl AltoElement {
             _height: height,
             _screen_x: screen_x,
             _screen_y: screen_y,
+            element_type,
         }
     }
 }
@@ -96,6 +118,8 @@ struct WysiwygEditor {
     // Undo/redo system
     history: Vec<String>,
     history_index: isize, // -1 means at latest, 0+ means historical position
+    // Layout mode
+    layout_mode: LayoutMode,
 }
 
 impl WysiwygEditor {
@@ -130,6 +154,7 @@ impl WysiwygEditor {
             pan_offset_y: 0,
             history: Vec::new(),
             history_index: -1,
+            layout_mode: LayoutMode::Spatial, // Start with good tables
         };
         
         editor.load_page()?;
@@ -145,80 +170,239 @@ impl WysiwygEditor {
     }
     
     fn rebuild_text_buffer(&mut self) {
-        // Sort elements by position to create readable text flow
-        let mut sorted_elements = self.elements.clone();
-        sorted_elements.sort_by(|a, b| {
-            a.vpos.partial_cmp(&b.vpos)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.hpos.partial_cmp(&b.hpos).unwrap_or(std::cmp::Ordering::Equal))
-        });
+        if self.elements.is_empty() {
+            self.text_buffer = String::new();
+            return;
+        }
         
-        // Calculate page width bounds for center detection
-        let min_hpos = sorted_elements.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
-        let max_hpos = sorted_elements.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
+        match self.layout_mode {
+            LayoutMode::Spatial => self.rebuild_spatial_layout(),
+            LayoutMode::Sequential => self.rebuild_sequential_layout(),
+        }
+    }
+    
+    fn rebuild_spatial_layout(&mut self) {
+        // Calculate page bounds for proper scaling
+        let min_hpos = self.elements.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
+        let max_hpos = self.elements.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
+        let min_vpos = self.elements.iter().map(|e| e.vpos).fold(f32::INFINITY, f32::min);
+        let max_vpos = self.elements.iter().map(|e| e.vpos + e._height).fold(f32::NEG_INFINITY, f32::max);
+        
+        let page_width = max_hpos - min_hpos;
+        let page_height = max_vpos - min_vpos;
+        
+        // Create spatial grid for terminal display
+        let terminal_width = 120; // Wider for better table handling
+        let terminal_height = 60;
+        
+        // Create 2D grid to place elements
+        let mut grid: Vec<Vec<String>> = vec![vec![" ".to_string(); terminal_width]; terminal_height];
+        
+        // Debug: Log how many elements we have and their types
+        let total_elements = self.elements.len();
+        let space_elements = self.elements.iter().filter(|e| e.content == " ").count();
+        let text_elements = self.elements.iter().filter(|e| e.content != " ").count();
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/chonker95_debug.log")
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(file, "LAYOUT: Total elements: {}, Space elements: {}, Text elements: {}", 
+                    total_elements, space_elements, text_elements)
+            });
+
+        // Map each element to terminal grid using precise coordinates (RESTORE HIGH WATERMARK)
+        for element in &self.elements {
+            // Don't skip spaces anymore - they're important for layout
+            let content = if element.content == " " {
+                " " // Preserve space elements as-is
+            } else {
+                element.content.trim()
+            };
+            
+            if content.is_empty() && element.content != " " {
+                continue; // Skip only truly empty content, not spaces
+            }
+            
+            // Better coordinate mapping with clustering for nearby elements
+            let raw_x = if page_width > 0.0 {
+                (element.hpos - min_hpos) / page_width * (terminal_width as f32 - 10.0)
+            } else {
+                0.0
+            };
+            
+            let raw_y = if page_height > 0.0 {
+                (element.vpos - min_vpos) / page_height * (terminal_height as f32 - 5.0)
+            } else {
+                0.0
+            };
+            
+            // Smart quantization - cluster nearby coordinates
+            let x = self.quantize_coordinate(raw_x, 2.0) as usize; // 2-char clustering
+            let y = self.quantize_coordinate(raw_y, 1.0) as usize; // 1-line clustering
+            
+            // Place text in grid, handling overlaps
+            let content = if element.content == " " {
+                " " // Preserve space elements as-is
+            } else {
+                element.content.trim()
+            };
+            
+            if y < terminal_height && x < terminal_width && !content.is_empty() {
+                // For space elements, just place a single space
+                if element.content == " " {
+                    if grid[y][x] == " " { // Only place space if position is empty
+                        grid[y][x] = " ".to_string();
+                    }
+                } else {
+                    // For text elements, place character by character
+                    let chars: Vec<char> = content.chars().collect();
+                    for (i, ch) in chars.iter().enumerate() {
+                        let pos_x = x + i;
+                        if pos_x < terminal_width {
+                            // Only overwrite spaces or if this element has higher priority
+                            if grid[y][pos_x] == " " || self.has_higher_priority(element, &grid[y][pos_x]) {
+                                grid[y][pos_x] = ch.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Convert grid back to text buffer
+        self.text_buffer = String::new();
+        for row in &grid {
+            let line: String = row.iter()
+                .map(|cell| cell.as_str())
+                .collect::<Vec<_>>()
+                .join("")
+                .trim_end()
+                .to_string();
+            
+            if !line.trim().is_empty() || !self.text_buffer.is_empty() {
+                self.text_buffer.push_str(&line);
+                self.text_buffer.push('\n');
+            }
+        }
+    }
+    
+    fn rebuild_sequential_layout(&mut self) {
+        // Group elements by line and process sequentially for good text flow
+        let min_hpos = self.elements.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
+        let max_hpos = self.elements.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
+        let min_vpos = self.elements.iter().map(|e| e.vpos).fold(f32::INFINITY, f32::min);
+        
         let page_width = max_hpos - min_hpos;
         let page_center = min_hpos + (page_width / 2.0);
         
-        // Group elements by vertical position (same line)
-        let mut lines: Vec<Vec<AltoElement>> = Vec::new();
-        let mut current_line: Vec<AltoElement> = Vec::new();
-        let mut last_vpos = -1.0;
-        
-        for element in sorted_elements {
-            let vpos_gap = element.vpos - last_vpos;
-            
-            if last_vpos >= 0.0 && vpos_gap > 8.0 { // New line threshold
-                if !current_line.is_empty() {
-                    lines.push(current_line.clone());
-                    current_line.clear();
-                }
-            }
-            
-            current_line.push(element.clone());
-            last_vpos = element.vpos;
+        // Group elements by line with better clustering
+        let mut lines_map = std::collections::HashMap::new();
+        for element in &self.elements {
+            let line_y = ((element.vpos - min_vpos) / 8.0) as usize; // Tighter line grouping
+            lines_map.entry(line_y).or_insert_with(Vec::new).push(element.clone());
         }
         
-        if !current_line.is_empty() {
-            lines.push(current_line);
-        }
+        let mut output_lines = Vec::new();
+        let char_width = 6.0;
+        let terminal_width = 80;
+        let mut last_vpos = 0.0;
         
-        // Build text with preserved spatial layout
-        self.text_buffer = String::new();
-        let terminal_width = 80; // Assume 80 chars for text panel
-        
-        for (line_idx, line) in lines.iter().enumerate() {
-            if line_idx > 0 {
-                // Determine spacing based on vertical gap
-                let current_vpos = line.first().map(|e| e.vpos).unwrap_or(0.0);
-                let prev_vpos = lines.get(line_idx - 1)
-                    .and_then(|prev_line| prev_line.first())
-                    .map(|e| e.vpos)
-                    .unwrap_or(0.0);
-                let vpos_gap = current_vpos - prev_vpos;
+        for y in 0..60 {
+            if let Some(mut line_elements) = lines_map.remove(&y) {
+                // Sort by horizontal position
+                line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap_or(std::cmp::Ordering::Equal));
                 
-                if vpos_gap > 20.0 {
-                    self.text_buffer.push_str("\n\n"); // Paragraph break
-                } else {
-                    self.text_buffer.push('\n'); // Normal line break
+                // Check for paragraph breaks based on vertical gap
+                let current_vpos = line_elements.first().map(|e| e.vpos).unwrap_or(0.0);
+                let vpos_gap = current_vpos - last_vpos;
+                
+                // Add paragraph breaks for large gaps
+                if last_vpos > 0.0 && vpos_gap > 20.0 {
+                    output_lines.push(String::new()); // Empty line for paragraph break
                 }
-            }
-            
-            // Check if this line should be centered
-            if self.is_line_centered(line, page_center, page_width) {
-                let line_text = line.iter().map(|e| e.content.as_str()).collect::<Vec<_>>().join(" ");
-                let padding = ((terminal_width as i32 - line_text.len() as i32) / 2).max(0) as usize;
-                self.text_buffer.push_str(&" ".repeat(padding));
-                self.text_buffer.push_str(&line_text);
-            } else {
-                // Regular left-aligned text
-                for (elem_idx, element) in line.iter().enumerate() {
-                    if elem_idx > 0 {
-                        self.text_buffer.push(' ');
+                
+                // Build line with proper spacing
+                let mut line_output = String::new();
+                for element in &line_elements {
+                    match element.element_type {
+                        ElementType::Text => {
+                            line_output.push_str(element.content.trim());
+                        }
+                        ElementType::Space => {
+                            let space_count = (element._width / char_width).round().max(1.0) as usize;
+                            line_output.push_str(&" ".repeat(space_count.min(3)));
+                        }
                     }
-                    self.text_buffer.push_str(&element.content);
                 }
+                
+                // Check if line should be centered (like titles, table headers)
+                if self.is_line_centered_sequential(&line_elements, page_center, page_width) {
+                    let padding = ((terminal_width as i32 - line_output.len() as i32) / 2).max(0) as usize;
+                    line_output = format!("{}{}", " ".repeat(padding), line_output);
+                }
+                
+                output_lines.push(line_output);
+                last_vpos = current_vpos;
             }
         }
+        
+        // Remove trailing empty lines
+        while output_lines.last() == Some(&String::new()) {
+            output_lines.pop();
+        }
+        
+        self.text_buffer = output_lines.join("\n");
+    }
+    
+    fn is_line_centered_sequential(&self, line: &[AltoElement], page_center: f32, page_width: f32) -> bool {
+        if line.is_empty() {
+            return false;
+        }
+        
+        // Calculate the center of this line's text
+        let line_start = line.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
+        let line_end = line.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
+        let line_center = line_start + ((line_end - line_start) / 2.0);
+        
+        // Consider it centered if within 15% of page center
+        let tolerance = page_width * 0.15;
+        let distance_from_center = (line_center - page_center).abs();
+        
+        // Also check if line is significantly shorter than full width (typical for centered content)
+        let line_width = line_end - line_start;
+        let is_short_line = line_width < (page_width * 0.7);
+        
+        distance_from_center < tolerance && is_short_line
+    }
+    
+    fn toggle_layout_mode(&mut self) -> Result<()> {
+        self.layout_mode = match self.layout_mode {
+            LayoutMode::Spatial => LayoutMode::Sequential,
+            LayoutMode::Sequential => LayoutMode::Spatial,
+        };
+        
+        // Rebuild with new layout mode
+        self.rebuild_text_buffer();
+        
+        Ok(())
+    }
+    
+    fn has_higher_priority(&self, element: &AltoElement, existing: &str) -> bool {
+        // Prefer actual content over spaces, numbers over letters for tables
+        if existing == " " {
+            return true;
+        }
+        
+        let content = &element.content;
+        // Numbers and money values have higher priority for table alignment
+        content.chars().any(|c| c.is_numeric() || c == '$' || c == '%')
+    }
+    
+    fn quantize_coordinate(&self, raw_coord: f32, cluster_size: f32) -> f32 {
+        // Cluster nearby coordinates to same terminal position
+        (raw_coord / cluster_size).round() * cluster_size
     }
     
     fn is_line_centered(&self, line: &[AltoElement], page_center: f32, page_width: f32) -> bool {
@@ -247,7 +431,7 @@ impl WysiwygEditor {
             .args([
                 "-f", &self.current_page.to_string(),
                 "-l", &self.current_page.to_string(),
-                "-readingOrder", "-noImage", "-noLineNumbers",
+                "-noImage", "-noLineNumbers",
             ])
             .arg(&self.pdf_path)
             .arg("/dev/stdout")
@@ -273,6 +457,7 @@ impl WysiwygEditor {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                     if e.name().as_ref() == b"String" {
+                        // Parse text elements
                         let mut content = String::new();
                         let mut hpos = 0.0;
                         let mut vpos = 0.0;
@@ -306,6 +491,37 @@ impl WysiwygEditor {
                             ));
                             element_id += 1;
                         }
+                    } else if e.name().as_ref() == b"SP" {
+                        // Parse space elements - these are the missing word boundaries!
+                        let mut hpos = 0.0;
+                        let mut vpos = 0.0;
+                        let mut width = 3.0; // Default space width
+                        let height = 10.0;
+                        
+                        for attr in e.attributes().with_checks(false) {
+                            if let Ok(attr) = attr {
+                                let key = String::from_utf8_lossy(attr.key.as_ref());
+                                let value = String::from_utf8_lossy(&attr.value);
+                                
+                                match key.as_ref() {
+                                    "HPOS" => hpos = value.parse().unwrap_or(0.0),
+                                    "VPOS" => vpos = value.parse().unwrap_or(0.0),
+                                    "WIDTH" => width = value.parse().unwrap_or(3.0),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        
+                        // Add space as an element
+                        elements.push(AltoElement::new(
+                            format!("space_{}", element_id),
+                            " ".to_string(), // Single space character
+                            hpos,
+                            vpos,
+                            width,
+                            height,
+                        ));
+                        element_id += 1;
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -339,20 +555,26 @@ impl WysiwygEditor {
             self.render_text_only()?;
         }
         
-        // Status line with zoom level and active pane
+        // Status line with layout mode and pane info
+        let mode_indicator = match self.layout_mode {
+            LayoutMode::Spatial => "SPATIAL",
+            LayoutMode::Sequential => "FLOW",
+        };
+        
         let pane_indicator = if self.ab_mode {
             match self.active_pane {
-                ActivePane::Image => " - [IMAGE] (Tab to switch)",
-                ActivePane::Text => " - [TEXT] (Tab to switch)",
+                ActivePane::Image => " - [IMAGE]",
+                ActivePane::Text => " - [TEXT]",
             }
         } else {
             ""
         };
         
-        let status_text = format!("{} - Page {} - {}%{}", 
+        let status_text = format!("{} - Page {} - {}% - {} (Ctrl+L){}", 
             self.pdf_path.file_stem().unwrap_or_default().to_string_lossy(),
             self.current_page,
             self.zoom_level,
+            mode_indicator,
             pane_indicator);
         
         execute!(
@@ -1031,6 +1253,9 @@ impl WysiwygEditor {
             }
             KeyCode::Char('y') | KeyCode::Char('Y') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.redo()?;
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.toggle_layout_mode()?;
             }
             _ => {}
         }
