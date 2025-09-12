@@ -1,276 +1,167 @@
 use anyhow::Result;
-use ropey::Rope;
-use std::collections::HashMap;
+use clap::Parser;
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+    execute,
+    style::{Color, Print, ResetColor, SetForegroundColor},
+    terminal::{self, Clear, ClearType},
+};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
+#[derive(Parser)]
+#[command(author, version, about)]
+struct Cli {
+    /// PDF file to process
+    file: PathBuf,
+    
+    /// Page number to extract (default: 1)
+    #[arg(short, long, default_value_t = 1)]
+    page: u32,
+}
+
 #[derive(Debug, Clone)]
-struct UnifiedAltoElement {
+struct AltoElement {
+    id: String,
     content: String,
     hpos: f32,
     vpos: f32,
+    width: f32,
+    height: f32,
+    // Screen position (calculated from PDF coordinates)
+    screen_x: u16,
+    screen_y: u16,
 }
 
-#[derive(Debug, Clone)]
-struct Word {
-    content: String,
-    hpos: f32,
-    vpos: f32,
-}
-
-#[derive(Debug, Clone)]
-struct Line {
-    words: Vec<Word>,
-    avg_vpos: f32,
-    is_table: bool,
-}
-
-impl UnifiedAltoElement {
-    fn new(content: String, hpos: f32, vpos: f32) -> Self {
-        Self { content, hpos, vpos }
+impl AltoElement {
+    fn new(id: String, content: String, hpos: f32, vpos: f32, width: f32, height: f32) -> Self {
+        let screen_x = (hpos / 8.0) as u16; // Convert PDF coords to terminal coords
+        let screen_y = (vpos / 12.0) as u16;
+        
+        Self {
+            id,
+            content,
+            hpos,
+            vpos,
+            width,
+            height,
+            screen_x,
+            screen_y,
+        }
     }
 }
 
-
-struct EditorState {
-    fake_scroll_x: f32,
-    needs_repaint: bool,
-    last_text_hash: u64,
+struct WysiwygEditor {
+    elements: Vec<AltoElement>,
+    pdf_path: PathBuf,
     current_page: u32,
+    terminal_width: u16,
+    terminal_height: u16,
+    // Text buffer for continuous editing
+    text_buffer: String,
+    cursor_x: u16,
+    cursor_y: u16,
+    // A-B comparison mode
+    ab_mode: bool,
+    pdf_image_rendered: bool,
 }
 
-impl Default for EditorState {
-    fn default() -> Self {
-        Self { 
-            fake_scroll_x: 0.0, 
-            needs_repaint: true, 
-            last_text_hash: 0,
-            current_page: 1,
-        }
-    }
-}
-
-struct UnifiedAltoEditor {
-    grid_rope: Rope,
-    grid_text_cache: Option<String>,
-    rope_dirty: bool,
-    state: EditorState,
-}
-
-impl UnifiedAltoEditor {
-    fn new() -> Self {
-        let mut editor = Self { 
-            grid_rope: Rope::new(),
-            grid_text_cache: None,
-            rope_dirty: true,
-            state: EditorState::default() 
+impl WysiwygEditor {
+    fn new(pdf_path: PathBuf, page: u32) -> Result<Self> {
+        let (width, height) = terminal::size()?;
+        let mut editor = Self {
+            elements: Vec::new(),
+            pdf_path,
+            current_page: page,
+            terminal_width: width,
+            terminal_height: height,
+            text_buffer: String::new(),
+            cursor_x: 0,
+            cursor_y: 0,
+            ab_mode: false,
+            pdf_image_rendered: false,
         };
-        // Start with empty text editor
-        editor.rebuild_grid(vec![]);
-        editor
-    }
-    
-    fn get_text_for_egui(&mut self) -> String {
-        if self.rope_dirty || self.grid_text_cache.is_none() {
-            let text = self.grid_rope.to_string();
-            self.grid_text_cache = Some(text.clone());
-            self.rope_dirty = false;
-            text
-        } else {
-            self.grid_text_cache.as_ref().unwrap().clone()
-        }
-    }
-    
-    // Step 1: Word Extraction  
-    fn extract_words(&self, elements: &[UnifiedAltoElement]) -> Vec<Word> {
-        elements.iter()
-            .map(|elem| Word {
-                content: elem.content.clone(),
-                hpos: elem.hpos,
-                vpos: elem.vpos,
-            })
-            .collect()
-    }
-    
-    // Step 2: Line Formation
-    fn form_lines(&self, words: Vec<Word>) -> Vec<Line> {
-        let mut lines_map = std::collections::BTreeMap::new();
         
-        for word in words {
-            let line_key = (word.vpos / 12.0) as i32; // Group by similar vpos
-            lines_map.entry(line_key).or_insert_with(Vec::new).push(word);
-        }
-        
-        lines_map.into_iter()
-            .map(|(_, mut words)| {
-                words.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap_or(std::cmp::Ordering::Equal));
-                let avg_vpos = words.iter().map(|w| w.vpos).sum::<f32>() / words.len() as f32;
-                Line {
-                    words,
-                    avg_vpos,
-                    is_table: false, // Will be set by detector
-                }
-            })
-            .collect()
+        editor.load_page()?;
+        Ok(editor)
     }
     
-    // Step 3: Table Detection Lever
-    fn detect_tables(&self, lines: &mut [Line]) {
-        for i in 0..lines.len() {
-            if lines[i].words.len() < 2 { continue; }
+    fn load_page(&mut self) -> Result<()> {
+        self.elements = self.extract_alto_elements()?;
+        self.rebuild_text_buffer();
+        Ok(())
+    }
+    
+    fn rebuild_text_buffer(&mut self) {
+        // Sort elements by position to create readable text flow
+        let mut sorted_elements = self.elements.clone();
+        sorted_elements.sort_by(|a, b| {
+            a.vpos.partial_cmp(&b.vpos)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.hpos.partial_cmp(&b.hpos).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        
+        // Build continuous text with intelligent line break preservation
+        self.text_buffer = String::new();
+        let mut last_vpos = 0.0;
+        
+        for element in &sorted_elements {
+            // Calculate vertical gap from previous element
+            let vpos_gap = element.vpos - last_vpos;
             
-            // Look for vertical alignment patterns
-            let mut alignment_score = 0;
-            let current_positions: Vec<f32> = lines[i].words.iter().map(|w| w.hpos).collect();
-            
-            // Check lines above and below for similar hpos patterns
-            for j in 0..lines.len() {
-                if i == j || lines[j].words.len() < 2 { continue; }
-                
-                let other_positions: Vec<f32> = lines[j].words.iter().map(|w| w.hpos).collect();
-                
-                // Count how many positions align (within tolerance)
-                for &pos1 in &current_positions {
-                    for &pos2 in &other_positions {
-                        if (pos1 - pos2).abs() < 20.0 { // 20px tolerance
-                            alignment_score += 1;
-                        }
-                    }
-                }
-            }
-            
-            // If we find enough alignments, mark as table
-            lines[i].is_table = alignment_score > lines[i].words.len() * 2;
-        }
-    }
-    
-    // Step 4: Formatter Behavior with center-alignment detection
-    fn format_line(&self, line: &Line) -> String {
-        if line.words.is_empty() {
-            return String::new();
-        }
-        
-        // Check if this line is centered (starts around middle of page)
-        let first_word_hpos = line.words[0].hpos;
-        let page_width = 612.0; // Standard PDF page width
-        let is_centered = first_word_hpos > (page_width * 0.25) && first_word_hpos < (page_width * 0.75);
-        
-        // Check if it's a title-like line (short, likely all caps or title case)
-        let total_chars: usize = line.words.iter().map(|w| w.content.len()).sum();
-        let is_likely_title = total_chars < 80 && line.words.len() < 8;
-        
-        if is_centered && is_likely_title {
-            // Center-align titles and headers
-            let text = line.words.iter().map(|w| w.content.as_str()).collect::<Vec<_>>().join(" ");
-            let terminal_width = 80; // Assume 80-char terminal width
-            let text_len = text.len();
-            if text_len < terminal_width {
-                let padding = (terminal_width - text_len) / 2;
-                format!("{}{}", " ".repeat(padding), text)
+            // Determine how many line breaks are needed
+            let line_breaks = if last_vpos == 0.0 {
+                0 // First element
+            } else if vpos_gap > 20.0 {
+                2 // Large gap - paragraph break
+            } else if vpos_gap > 12.0 {
+                1 // Normal line break
             } else {
-                text
-            }
-        } else if !line.is_table {
-            // Paragraph mode: natural spacing
-            line.words.iter().map(|w| w.content.as_str()).collect::<Vec<_>>().join(" ")
-        } else {
-            // Table mode: coordinate-aligned spacing
-            let mut result = String::new();
-            let mut current_pos = 0.0;
+                0 // Same line - add space instead
+            };
             
-            for (i, word) in line.words.iter().enumerate() {
-                if i > 0 {
-                    let spaces_needed = ((word.hpos - current_pos) / 4.5).max(1.0).min(20.0) as usize;
-                    result.push_str(&" ".repeat(spaces_needed));
-                }
-                result.push_str(&word.content);
-                current_pos = word.hpos + (word.content.len() as f32 * 4.5);
+            // Add the determined line breaks
+            for _ in 0..line_breaks {
+                self.text_buffer.push('\n');
             }
-            result
+            
+            // Add horizontal spacing for same-line elements
+            if line_breaks == 0 && !self.text_buffer.is_empty() {
+                self.text_buffer.push(' ');
+            }
+            
+            self.text_buffer.push_str(&element.content);
+            last_vpos = element.vpos;
         }
     }
-
-    fn rebuild_grid(&mut self, elements: Vec<UnifiedAltoElement>) {
-        // Step 1: Extract words
-        let words = self.extract_words(&elements);
-        
-        // Step 2: Form lines
-        let mut lines = self.form_lines(words);
-        
-        // Step 3: Detect tables
-        self.detect_tables(&mut lines);
-        
-        // Step 4 & 5: Format and assemble output with preserved spacing
-        let mut formatted_text = String::new();
-        
-        if !lines.is_empty() {
-            // Sort lines by their vertical position
-            lines.sort_by(|a, b| a.avg_vpos.partial_cmp(&b.avg_vpos).unwrap_or(std::cmp::Ordering::Equal));
+    
+    fn extract_alto_elements(&self) -> Result<Vec<AltoElement>> {
+        let output = std::process::Command::new("pdfalto")
+            .args([
+                "-f", &self.current_page.to_string(),
+                "-l", &self.current_page.to_string(),
+                "-readingOrder", "-noImage", "-noLineNumbers",
+            ])
+            .arg(&self.pdf_path)
+            .arg("/dev/stdout")
+            .output()?;
             
-            let mut last_vpos = lines[0].avg_vpos;
-            
-            for line in lines {
-                // Calculate how many line breaks should exist based on vertical gap
-                let vpos_gap = line.avg_vpos - last_vpos;
-                let line_breaks_needed = (vpos_gap / 12.0).round() as i32; // 12pt = typical line height
-                
-                // Add empty lines for gaps (minimum 1, maximum 5 to prevent huge gaps)
-                let empty_lines = line_breaks_needed.max(1).min(5) - 1;
-                for _ in 0..empty_lines {
-                    formatted_text.push('\n');
-                }
-                
-                let formatted_line = self.format_line(&line);
-                formatted_text.push_str(&formatted_line);
-                formatted_text.push('\n');
-                
-                last_vpos = line.avg_vpos;
-            }
+        if !output.status.success() {
+            return Ok(vec![]);
         }
         
-        // Update rope with formatted text
-        self.grid_rope = Rope::from_str(&formatted_text);
-        self.grid_text_cache = None;
-        self.rope_dirty = true;
+        let xml_data = String::from_utf8_lossy(&output.stdout);
+        Ok(self.parse_alto_xml(&xml_data))
     }
     
-    
-    fn load_page_from_pdf(&mut self, pdf_path: &str, page: u32) {
-        self.state.current_page = page;
-        let elements = Self::load_alto_page_from_pdf(pdf_path, page);
-        self.rebuild_grid(elements);
-    }
-    
-    fn load_alto_page_from_pdf(pdf_path: &str, page: u32) -> Vec<UnifiedAltoElement> {
-        // Extract all ALTO elements from PDF using our proven parsing
-        
-        std::process::Command::new("pdfalto")
-            .args(["-f", &page.to_string(), "-l", &page.to_string(), "-readingOrder", "-noImage", "-noLineNumbers",
-                   pdf_path, "/dev/stdout"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| {
-                let xml_data = String::from_utf8_lossy(&output.stdout);
-                Self::parse_alto_elements(&xml_data)
-            })
-            .unwrap_or_else(Self::create_fallback_elements)
-    }
-    
-    fn create_fallback_elements() -> Vec<UnifiedAltoElement> {
-        vec![
-            UnifiedAltoElement::new("DEMO".to_string(), 160.8, 84.8),
-            UnifiedAltoElement::new("ALTO".to_string(), 200.0, 84.8),
-            UnifiedAltoElement::new("EDITOR".to_string(), 240.0, 84.8),
-            UnifiedAltoElement::new("No PDF loaded - demo mode".to_string(), 78.6, 110.0),
-        ]
-    }
-    
-    fn parse_alto_elements(xml: &str) -> Vec<UnifiedAltoElement> {
+    fn parse_alto_xml(&self, xml: &str) -> Vec<AltoElement> {
         use quick_xml::{Reader, events::Event};
         
         let mut elements = Vec::new();
         let mut reader = Reader::from_str(xml);
         let mut buf = Vec::new();
+        let mut element_id = 0;
         
         loop {
             match reader.read_event_into(&mut buf) {
@@ -279,6 +170,8 @@ impl UnifiedAltoEditor {
                         let mut content = String::new();
                         let mut hpos = 0.0;
                         let mut vpos = 0.0;
+                        let mut width = 0.0;
+                        let mut height = 10.0;
                         
                         for attr in e.attributes().with_checks(false) {
                             if let Ok(attr) = attr {
@@ -289,13 +182,23 @@ impl UnifiedAltoEditor {
                                     "CONTENT" => content = value.to_string(),
                                     "HPOS" => hpos = value.parse().unwrap_or(0.0),
                                     "VPOS" => vpos = value.parse().unwrap_or(0.0),
+                                    "WIDTH" => width = value.parse().unwrap_or(0.0),
+                                    "HEIGHT" => height = value.parse().unwrap_or(10.0),
                                     _ => {}
                                 }
                             }
                         }
                         
                         if !content.is_empty() {
-                            elements.push(UnifiedAltoElement::new(content, hpos, vpos));
+                            elements.push(AltoElement::new(
+                                format!("elem_{}", element_id),
+                                content,
+                                hpos,
+                                vpos,
+                                width,
+                                height,
+                            ));
+                            element_id += 1;
                         }
                     }
                 }
@@ -308,465 +211,402 @@ impl UnifiedAltoEditor {
         elements
     }
     
-    fn show(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        let input = ui.input(|i| i.clone());
-
-
-        // HORIZONTAL SWIPE HACK: Only respond to horizontal scroll for left/right pan
-        let mut scroll_changed = false;
-        if input.raw_scroll_delta.x.abs() > input.raw_scroll_delta.y.abs() && input.raw_scroll_delta.x.abs() > 0.1 {
-            let old_scroll = self.state.fake_scroll_x;
-            self.state.fake_scroll_x += input.raw_scroll_delta.x;
-            
-            // IMPROVED BOUNDS: Content width vs panel width with safety margins
-            let max_line_length = self.grid_rope.lines()
-                .map(|line| line.len_chars())
-                .max()
-                .unwrap_or(140) as f32;
-            let panel_width = ui.available_width();
-            let content_width = max_line_length * 7.2; // Accurate character width
-            
-            // CLAMP WITH MARGINS: Prevent infinite pan but allow some overscroll
-            let margin = 50.0;
-            let min_scroll = (panel_width - content_width - margin).min(margin);
-            let max_scroll = margin;
-            
-            self.state.fake_scroll_x = self.state.fake_scroll_x.clamp(min_scroll, max_scroll);
-            scroll_changed = self.state.fake_scroll_x != old_scroll;
-            
-            if scroll_changed {
-                self.state.needs_repaint = true; // Only repaint when scroll actually changes
-            }
-        }
-
-        // SIMPLE SCROLLABLE TERMINAL GRID: Performance optimized
-        if self.state.needs_repaint || scroll_changed {
-            // Only request repaint when actually needed
-            ui.ctx().request_repaint();
-            self.state.needs_repaint = false;
+    fn render(&self) -> Result<()> {
+        execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        
+        if self.ab_mode {
+            self.render_split_screen()?;
+        } else {
+            self.render_text_only()?;
         }
         
-        egui::ScrollArea::both()
-            .auto_shrink([false; 2])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden) // Hide scroll bars
-            .show(ui, |ui| {
-                // Calculate size based on content
-                let char_width = 7.2; // Monospace character width
-                let line_height = 14.0; // Line height
-                let max_line_length = self.grid_rope.lines()
-                    .map(|line| line.len_chars())
-                    .max()
-                    .unwrap_or(140) as f32;
-                let line_count = self.grid_rope.lines().count() as f32;
-                let content_width = max_line_length * char_width;
-                let content_height = line_count * line_height;
-                
-                // Dramatically extend content width to prevent wrapping when zoomed
-                let extended_width = content_width * 5.0; // Much wider to handle zoom
-                
-                let mut text_for_egui = self.get_text_for_egui();
-                let response = ui.add_sized(
-                    egui::vec2(extended_width, content_height),
-                    egui::TextEdit::multiline(&mut text_for_egui)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(extended_width)
-                        .frame(false)
-                );
-                
-                // Update cache and rope if text was modified
-                if response.changed() {
-                    self.grid_rope = Rope::from_str(&text_for_egui);
-                    self.grid_text_cache = Some(text_for_egui);
-                    self.rope_dirty = false;
-                }
-                
-                // THROTTLED GRID UPDATES: Only update when text actually changes
-                if response.changed() {
-                    // Inline hash calculation for performance
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    self.grid_rope.to_string().hash(&mut hasher);
-                    let new_hash = hasher.finish();
-                    
-                    if new_hash != self.state.last_text_hash {
-                        self.state.last_text_hash = new_hash;
-                        self.state.needs_repaint = true;
-                    }
-                }
-                
-                response
-            }).inner
+        // Show status line
+        let mode_indicator = if self.ab_mode { "A-B COMPARE" } else { "TEXT EDIT" };
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, self.terminal_height - 1),
+            SetForegroundColor(Color::Yellow),
+            Print(format!("Chonker95 - {} - Page {} | {} | Cursor: {},{} | Ctrl+A toggle, Q quit", 
+                self.pdf_path.file_name().unwrap_or_default().to_string_lossy(),
+                self.current_page,
+                mode_indicator,
+                self.cursor_x,
+                self.cursor_y)),
+            ResetColor
+        )?;
+        
+        // Position cursor (may be off-screen, that's OK)
+        if !self.ab_mode {
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(self.cursor_x, self.cursor_y),
+                cursor::Show
+            )?;
+        }
+        
+        io::stdout().flush()?;
+        Ok(())
     }
     
-}
-
-struct AltoApp {
-    editor: UnifiedAltoEditor,
-    // PDF display state
-    pdf_path: Option<PathBuf>,
-    current_page: usize,
-    total_pages: usize,
-    // Performance caching
-    page_cache: std::collections::HashMap<usize, egui::TextureHandle>,
-    // UI state
-    show_pdf_panel: bool,
-    zoom_level: f32,
-}
-
-impl Default for AltoApp {
-    fn default() -> Self {
-        let editor = UnifiedAltoEditor::new();
-        Self { 
-            editor,
-            pdf_path: None,
-            current_page: 1,
-            total_pages: 0,
-            page_cache: HashMap::new(),
-            show_pdf_panel: false,  // Hidden by default
-            zoom_level: 2.0,
+    fn render_text_only(&self) -> Result<()> {
+        // Display the text buffer as continuous text (full width)
+        let lines: Vec<&str> = self.text_buffer.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if i < (self.terminal_height - 2) as usize {
+                execute!(
+                    io::stdout(),
+                    cursor::MoveTo(0, i as u16),
+                    Print(line)
+                )?;
+            }
         }
+        Ok(())
     }
-}
-
-impl AltoApp {
-    fn open_pdf(&mut self, path: PathBuf) {
-        self.pdf_path = Some(path.clone());
-        self.current_page = 1;
-        self.page_cache.clear();  // Clear cache for new PDF
+    
+    fn render_split_screen(&self) -> Result<()> {
+        let split_x = self.terminal_width / 2;
         
-        // Get total page count using pdfinfo
-        if let Ok(output) = std::process::Command::new("pdfinfo")
-            .arg(&path)
-            .output()
-        {
-            if output.status.success() {
-                let info = String::from_utf8_lossy(&output.stdout);
-                for line in info.lines() {
-                    if line.starts_with("Pages:") {
-                        if let Some(pages_str) = line.split_whitespace().nth(1) {
-                            self.total_pages = pages_str.parse().unwrap_or(1);
-                            break;
-                        }
-                    }
-                }
+        // Left side: PDF image area with debug info
+        if !self.pdf_image_rendered {
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(2, 2),
+                SetForegroundColor(Color::Cyan),
+                Print("Loading PDF image..."),
+                ResetColor,
+                cursor::MoveTo(2, 4),
+                SetForegroundColor(Color::Yellow),
+                Print(format!("Page: {}", self.current_page)),
+                ResetColor,
+                cursor::MoveTo(2, 5),
+                SetForegroundColor(Color::Yellow),
+                Print(format!("File: {}", self.pdf_path.display())),
+                ResetColor
+            )?;
+        } else {
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(2, 2),
+                SetForegroundColor(Color::Green),
+                Print("PDF IMAGE SHOULD BE HERE"),
+                ResetColor,
+                cursor::MoveTo(2, 3),
+                SetForegroundColor(Color::Green),
+                Print("(kitty graphics rendered)"),
+                ResetColor
+            )?;
+        }
+        
+        // Vertical separator
+        for y in 0..(self.terminal_height - 1) {
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(split_x, y),
+                SetForegroundColor(Color::Blue),
+                Print("│"),
+                ResetColor
+            )?;
+        }
+        
+        // Right side: Text extraction (constrained to right half)
+        let lines: Vec<&str> = self.text_buffer.lines().collect();
+        let right_panel_width = (self.terminal_width - split_x - 1) as usize;
+        
+        for (i, line) in lines.iter().enumerate() {
+            if i < (self.terminal_height - 2) as usize {
+                let trimmed_line = if line.len() > right_panel_width {
+                    &line[0..right_panel_width]
+                } else {
+                    line
+                };
+                execute!(
+                    io::stdout(),
+                    cursor::MoveTo(split_x + 1, i as u16),
+                    Print(trimmed_line)
+                )?;
             }
         }
         
-        // Sync text editor to the current page
-        self.sync_text_editor_page();
+        Ok(())
     }
     
-    fn sync_text_editor_page(&mut self) {
-        // Update text editor to show the same page as PDF viewer
-        if let Some(pdf_path) = &self.pdf_path {
-            self.editor.load_page_from_pdf(
-                pdf_path.to_str().unwrap_or(""), 
-                self.current_page as u32
-            );
-        }
-    }
-    
-    fn render_pdf_page(&mut self, ctx: &egui::Context, page: usize) -> Option<&egui::TextureHandle> {
-        // Check cache first for major performance boost
-        if self.page_cache.contains_key(&page) {
-            return self.page_cache.get(&page);
+    fn render_pdf_image(&mut self) -> Result<()> {
+        if !self.ab_mode || self.pdf_image_rendered {
+            return Ok(());
         }
         
-        // Only render if PDF panel is visible (conditional rendering)
-        if !self.show_pdf_panel {
-            return None;
-        }
+        // Use ghostscript to render PDF page  
+        let temp_file = format!("/tmp/chonker_kitty_{}", self.current_page);
+        let output_file = format!("{}.jpg", temp_file);
         
-        let pdf_path = self.pdf_path.as_ref()?;
-        let temp_file = format!("/tmp/chonker_page_{}", page);
+        // Debug: Show what command we're running
+        eprintln!("DEBUG: Running ghostscript for page {}", self.current_page);
         
-        // Calculate scaled size (reduced for performance)
-        let base_width = 300.0;  // Smaller for speed
-        let scaled_width = (base_width * self.zoom_level) as u32;
-        
-        // Use ghostscript for faster rendering
         let result = std::process::Command::new("gs")
             .args([
                 "-dNOPAUSE", "-dBATCH", "-dSAFER",
-                "-sDEVICE=png16m",
-                &format!("-dFirstPage={}", page),
-                &format!("-dLastPage={}", page),
-                &format!("-r{}", (72.0 * scaled_width as f32 / 612.0) as u32), // Calculate DPI
-                &format!("-sOutputFile={}-{:02}.png", temp_file, page),
+                "-sDEVICE=jpeggray", // Grayscale JPEG for smaller size
+                &format!("-dFirstPage={}", self.current_page),
+                &format!("-dLastPage={}", self.current_page),
+                "-r100", // Lower resolution for speed and size
+                "-dJPEGQ=80", // Good quality, smaller size
+                &format!("-sOutputFile={}", output_file),
             ])
-            .arg(pdf_path)
-            .output();
+            .arg(&self.pdf_path)
+            .output()?;
             
-        match result {
-            Ok(output) => {
-                if !output.status.success() {
-                    return None;
-                }
-            },
-            Err(e) => {
-                println!("DEBUG: Failed to execute pdftoppm: {}", e);
-                return None;
-            }
+        if !result.status.success() {
+            eprintln!("DEBUG: Ghostscript failed: {}", String::from_utf8_lossy(&result.stderr));
+            return Ok(());
         }
         
-        // Try both zero-padded and non-zero-padded formats
-        let image_path_padded = format!("{}-{:02}.png", temp_file, page);
-        let image_path_simple = format!("{}-{}.png", temp_file, page);
-        
-        let image_path = if std::path::Path::new(&image_path_padded).exists() {
-            image_path_padded
+        if std::path::Path::new(&output_file).exists() {
+            let file_size = std::fs::metadata(&output_file)?.len();
+            eprintln!("DEBUG: PNG created: {} ({} bytes)", output_file, file_size);
+            
+            // Don't delete the file so we can test it manually
+            self.display_image_in_kitty(&output_file)?;
+            self.pdf_image_rendered = true;
         } else {
-            image_path_simple
-        };
-        
-        if let Ok(img) = image::open(&image_path) {
-            let mut rgba_img = img.to_rgba8();
-            
-            // Convert to grayscale and invert for dark mode
-            for pixel in rgba_img.pixels_mut() {
-                // Fast grayscale conversion using integer math
-                let gray = ((pixel[0] as u16 * 77 + pixel[1] as u16 * 151 + pixel[2] as u16 * 28) >> 8) as u8;
-                
-                // Invert grayscale for dark mode (white text on dark background)
-                let inverted_gray = 255 - gray;
-                
-                // Set all channels to the inverted grayscale value
-                pixel[0] = inverted_gray;
-                pixel[1] = inverted_gray;
-                pixel[2] = inverted_gray;
-                // pixel[3] stays the same (Alpha)
-            }
-            
-            let size = [rgba_img.width() as usize, rgba_img.height() as usize];
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba_img);
-            let texture = ctx.load_texture(format!("page_{}_grayscale_{}", page, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()), color_image, egui::TextureOptions::NEAREST);
-            
-            // Clean up temp file immediately
-            let _ = std::fs::remove_file(&image_path);
-            
-            // Cache the texture for future use
-            self.page_cache.insert(page, texture);
-            return self.page_cache.get(&page);
-        } else {
-            println!("DEBUG: Failed to open image file: {}", image_path);
+            eprintln!("DEBUG: PNG file not created: {}", output_file);
         }
         
-        None
+        Ok(())
     }
     
-    fn show_pdf_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let current_page = self.current_page;
-        if let Some(texture) = self.render_pdf_page(ctx, current_page) {
-            let image_size = texture.size_vec2();
+    fn display_image_in_kitty(&self, image_path: &str) -> Result<()> {
+        // For ghostty terminal, try direct file display using kitty icat equivalent
+        let split_x = self.terminal_width / 2;
+        let cols = split_x - 2;
+        let rows = self.terminal_height - 3;
+        
+        // Position cursor at top-left of left panel
+        execute!(io::stdout(), cursor::MoveTo(0, 0))?;
+        
+        // For Ghostty: Try external image viewer as fallback
+        let result = std::process::Command::new("open")
+            .args(["-a", "Preview", image_path])
+            .spawn();
             
-            // Use full image size without scaling down
-            let display_size = image_size;
-            
-            // Create scrollable area for panning
-            let scroll_area = egui::ScrollArea::both()
-                .auto_shrink([false; 2])
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-                
-            let scroll_response = scroll_area.show(ui, |ui| {
-                ui.add_sized(
-                    display_size,
-                    egui::Image::new(texture)
-                        .bg_fill(egui::Color32::BLACK)
-                        .sense(egui::Sense::drag())
-                )
-            });
-            
-            // Handle drag for panning - update scroll offset
-            if scroll_response.inner.dragged() {
-                // egui ScrollArea handles dragging internally
+        match result {
+            Ok(_) => {
+                // External viewer launched
+                execute!(
+                    io::stdout(),
+                    cursor::MoveTo(2, 8),
+                    SetForegroundColor(Color::Green),
+                    Print("PDF opened in Preview"),
+                    ResetColor,
+                    cursor::MoveTo(2, 9),
+                    SetForegroundColor(Color::Yellow),
+                    Print("(Ghostty doesn't support kitty graphics)"),
+                    ResetColor
+                )?;
             }
-        } else {
-            ui.centered_and_justified(|ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 120, 120),
-                    "PDF rendering failed or no PDF loaded"
-                );
-            });
+            Err(_) => {
+                // Show file path for manual viewing
+                execute!(
+                    io::stdout(),
+                    cursor::MoveTo(2, 8),
+                    SetForegroundColor(Color::Red),
+                    Print("No image display available"),
+                    ResetColor,
+                    cursor::MoveTo(2, 9),
+                    SetForegroundColor(Color::Yellow),
+                    Print(format!("File: {}", image_path)),
+                    ResetColor
+                )?;
+            }
         }
+        
+        Ok(())
     }
-}
-
-impl eframe::App for AltoApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle keyboard shortcuts
-        ctx.input(|i| {
-            // Cmd+O to open PDF (Cmd on macOS, Ctrl on other platforms)
-            if i.modifiers.command && i.key_pressed(egui::Key::O) {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("PDF", &["pdf"])
-                    .pick_file()
-                {
-                    self.open_pdf(path);
-                }
-            }
-            
-            // Cmd+/Cmd- for zoom
-            if i.modifiers.command {
-                if i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus) {
-                    // Zoom in (faster steps)
-                    self.zoom_level = (self.zoom_level * 1.5).min(5.0);
-                    self.page_cache.clear();  // Clear cache on zoom change
-                } else if i.key_pressed(egui::Key::Minus) {
-                    // Zoom out (faster steps)
-                    self.zoom_level = (self.zoom_level / 1.5).max(0.3);
-                    self.page_cache.clear();  // Clear cache on zoom change
-                } else if i.key_pressed(egui::Key::Num0) {
-                    // Reset zoom
-                    self.zoom_level = 2.0;
-                    self.page_cache.clear();  // Clear cache on zoom reset
-                }
-            }
-            
-            // Arrow keys for navigation
-            if self.pdf_path.is_some() {
-                if i.key_pressed(egui::Key::ArrowLeft) && self.current_page > 1 {
-                    self.current_page -= 1;
-                    self.sync_text_editor_page();
-                } else if i.key_pressed(egui::Key::ArrowRight) && self.current_page < self.total_pages {
-                    self.current_page += 1;
-                    self.sync_text_editor_page();
-                }
-            }
-        });
-
-        let mut visuals = egui::Visuals::dark();
-        visuals.override_text_color = Some(egui::Color32::from_rgb(200, 200, 200));
-        ctx.set_visuals(visuals);
-        
-        // Top panel for controls
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.colored_label(egui::Color32::from_rgb(200, 200, 200), "CHONKER 9.5");
-                ui.separator();
-                
-                // File open button
-                if ui.button("📁 Open PDF (Cmd+O)").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PDF", &["pdf"])
-                        .pick_file()
-                    {
-                        self.open_pdf(path);
-                    }
-                }
-                
-                ui.separator();
-                
-                // PDF panel toggle button
-                let panel_text = if self.show_pdf_panel { "🖼️ Hide PDF" } else { "🖼️ Show PDF" };
-                if ui.button(panel_text).clicked() {
-                    self.show_pdf_panel = !self.show_pdf_panel;
-                }
-                
-                ui.separator();
-                
-                // Show current PDF info if loaded
-                if let Some(path) = &self.pdf_path {
-                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                        ui.colored_label(egui::Color32::from_rgb(180, 180, 180), filename);
-                    }
-                    
-                    ui.separator();
-                    
-                    // Unified navigation (controls both PDF and text)
-                    if ui.add_enabled(self.current_page > 1, egui::Button::new("◀")).clicked() {
-                        self.current_page -= 1;
-                        self.sync_text_editor_page();
-                    }
-                    
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 200, 200),
-                        format!("Page {}/{}", self.current_page, self.total_pages)
-                    );
-                    
-                    if ui.add_enabled(self.current_page < self.total_pages, egui::Button::new("▶")).clicked() {
-                        self.current_page += 1;
-                        self.sync_text_editor_page();
-                    }
-                    
-                    ui.separator();
-                    
-                    // Zoom indicator
-                    ui.colored_label(
-                        egui::Color32::from_rgb(160, 160, 160),
-                        format!("{}%", (self.zoom_level * 100.0) as i32)
-                    );
-                } else {
-                    ui.colored_label(egui::Color32::from_rgb(120, 120, 120), "No PDF loaded");
-                }
-            });
-        });
-        
-        // Left side panel for PDF display (conditional)
-        if self.show_pdf_panel {
-            egui::SidePanel::left("pdf_panel")
-                .min_width(600.0)
-                .default_width(800.0)
-                .frame(egui::Frame::default().fill(egui::Color32::BLACK))
-                .show(ctx, |ui| {
-                    if self.pdf_path.is_some() {
-                        self.show_pdf_page(ui, ctx);
-                    } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(50.0);
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(140, 140, 140),
-                                    "Click 'Open PDF' to load a document"
-                                );
-                                ui.add_space(20.0);
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(120, 120, 120),
-                                    "PDF will appear here when loaded"
-                                );
-                            });
-                        });
-                    }
-                });
+    
+    fn handle_mouse_click(&mut self, x: u16, y: u16) -> Result<()> {
+        // Allow cursor to go anywhere, even beyond viewport
+        if y < self.terminal_height - 1 { // Only avoid status line
+            self.cursor_x = x;
+            self.cursor_y = y;
+            // No bounds checking - cursor can go anywhere, even off-screen
         }
         
-        // Central panel for text editor
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(egui::Color32::BLACK))
-            .show(ctx, |ui| {
-                // Apply zoom to text size
-                let mut style = ui.style().as_ref().clone();
-                let base_font_size = 12.0;
-                let zoomed_font_size = base_font_size * self.zoom_level;
+        Ok(())
+    }
+    
+    fn handle_key_input(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
+        match key {
+            // Cursor movement
+            KeyCode::Up => {
+                if self.cursor_y > 0 {
+                    self.cursor_y -= 1;
+                }
+            }
+            KeyCode::Down => {
+                self.cursor_y += 1; // No bottom limit - can go beyond viewport
+            }
+            KeyCode::Left => {
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    // Ctrl+Left: Previous page
+                    if self.current_page > 1 {
+                        self.current_page -= 1;
+                        self.load_page()?;
+                    }
+                } else if self.cursor_x > 0 {
+                    self.cursor_x -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    // Ctrl+Right: Next page
+                    self.current_page += 1;
+                    self.load_page()?;
+                } else {
+                    self.cursor_x += 1; // No right limit - can go beyond viewport
+                }
+            }
+            KeyCode::Home => {
+                self.cursor_x = 0;
+            }
+            KeyCode::End => {
+                // Go to end of current line, not terminal edge
+                let lines: Vec<&str> = self.text_buffer.lines().collect();
+                if let Some(current_line) = lines.get(self.cursor_y as usize) {
+                    self.cursor_x = current_line.len() as u16;
+                } else {
+                    self.cursor_x = 0; // Empty line
+                }
+            }
+            
+            // Text editing
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_char_at_cursor(c)?;
+            }
+            KeyCode::Backspace => {
+                self.delete_char_at_cursor()?;
+            }
+            KeyCode::Enter => {
+                self.insert_char_at_cursor('\n')?;
+            }
+            
+            // Global commands
+            KeyCode::Char('a') | KeyCode::Char('A') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.ab_mode = !self.ab_mode;
+                if self.ab_mode {
+                    self.pdf_image_rendered = false; // Force re-render for A-B mode
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
+            _ => {}
+        }
+        
+        Ok(false)
+    }
+    
+    fn insert_char_at_cursor(&mut self, c: char) -> Result<()> {
+        let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
+        
+        // Ensure we have enough lines for cursor position
+        while lines.len() <= self.cursor_y as usize {
+            lines.push(String::new());
+        }
+        
+        // Get the current line, extending it if cursor is beyond text
+        let current_line = &mut lines[self.cursor_y as usize];
+        
+        // Extend line with spaces if cursor is beyond current text
+        while current_line.len() < self.cursor_x as usize {
+            current_line.push(' ');
+        }
+        
+        // Insert character at cursor position
+        let cursor_pos = self.cursor_x as usize;
+        if c == '\n' {
+            // Split line at cursor
+            let remaining = current_line.split_off(cursor_pos);
+            lines.insert(self.cursor_y as usize + 1, remaining);
+            self.cursor_y += 1;
+            self.cursor_x = 0;
+        } else {
+            current_line.insert(cursor_pos, c);
+            self.cursor_x += 1;
+        }
+        
+        // Rebuild text buffer
+        self.text_buffer = lines.join("\n");
+        Ok(())
+    }
+    
+    fn delete_char_at_cursor(&mut self) -> Result<()> {
+        if self.cursor_x > 0 {
+            let lines: Vec<&str> = self.text_buffer.lines().collect();
+            let mut new_buffer = String::new();
+            
+            for (i, line) in lines.iter().enumerate() {
+                if i == self.cursor_y as usize {
+                    let mut line_chars: Vec<char> = line.chars().collect();
+                    let cursor_pos = ((self.cursor_x - 1) as usize).min(line_chars.len());
+                    if cursor_pos < line_chars.len() {
+                        line_chars.remove(cursor_pos);
+                    }
+                    new_buffer.push_str(&line_chars.iter().collect::<String>());
+                    self.cursor_x -= 1;
+                } else {
+                    new_buffer.push_str(line);
+                }
                 
-                style.text_styles.insert(
-                    egui::TextStyle::Monospace,
-                    egui::FontId::new(zoomed_font_size, egui::FontFamily::Monospace)
-                );
-                ui.set_style(std::sync::Arc::new(style));
-                
-                self.editor.show(ui);
-            });
+                if i < lines.len() - 1 {
+                    new_buffer.push('\n');
+                }
+            }
+            
+            self.text_buffer = new_buffer;
+        }
+        Ok(())
     }
 }
 
 fn main() -> Result<()> {
-    let app = AltoApp::default();
+    let cli = Cli::parse();
     
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 800.0])
-            .with_title("WYSIWYG ALTO Spatial Editor - Unified Architecture"),
-        ..Default::default()
-    };
+    // Setup terminal
+    terminal::enable_raw_mode()?;
+    execute!(io::stdout(), terminal::EnterAlternateScreen, event::EnableMouseCapture)?;
     
-    if let Err(e) = eframe::run_native(
-        "WYSIWYG ALTO",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(app))),
-    ) {
-        eprintln!("❌ Failed: {}", e);
+    let mut editor = WysiwygEditor::new(cli.file, cli.page)?;
+    
+    loop {
+        // Render PDF image if we're in A-B mode and haven't rendered yet
+        if editor.ab_mode && !editor.pdf_image_rendered {
+            editor.render_pdf_image()?;
+        }
+        
+        editor.render()?;
+        
+        match event::read()? {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                ..
+            }) => {
+                editor.handle_mouse_click(x, y)?;
+            }
+            Event::Key(key_event) => {
+                if editor.handle_key_input(key_event.code, key_event.modifiers)? {
+                    break; // Quit requested
+                }
+            }
+            _ => {}
+        }
     }
+    
+    // Cleanup terminal
+    execute!(
+        io::stdout(),
+        terminal::LeaveAlternateScreen,
+        event::DisableMouseCapture
+    )?;
+    terminal::disable_raw_mode()?;
     
     Ok(())
 }
