@@ -123,6 +123,10 @@ struct WysiwygEditor {
     // Performance: dirty tracking
     text_buffer_dirty: bool,
     last_layout_mode: LayoutMode,
+    // Scroll offset for text mode
+    scroll_offset: usize,
+    // Total pages in PDF
+    total_pages: u32,
 }
 
 impl WysiwygEditor {
@@ -160,6 +164,8 @@ impl WysiwygEditor {
             layout_mode: LayoutMode::Spatial, // Start with good tables
             text_buffer_dirty: true, // Needs initial build
             last_layout_mode: LayoutMode::Spatial,
+            scroll_offset: 0,
+            total_pages: 1, // Will be updated after loading
         };
         
         editor.load_page()?;
@@ -169,9 +175,36 @@ impl WysiwygEditor {
     }
     
     fn load_page(&mut self) -> Result<()> {
+        // Update total pages when loading
+        self.update_total_pages()?;
         self.elements = self.extract_alto_elements()?;
         self.text_buffer_dirty = true; // New elements require rebuild
+        self.scroll_offset = 0; // Reset scroll when loading new page
         self.rebuild_text_buffer();
+        Ok(())
+    }
+    
+    fn update_total_pages(&mut self) -> Result<()> {
+        let output = std::process::Command::new("pdfinfo")
+            .arg(&self.pdf_path)
+            .output()?;
+            
+        if output.status.success() {
+            let info = std::str::from_utf8(&output.stdout).unwrap_or("");
+            for line in info.lines() {
+                if line.starts_with("Pages:") {
+                    if let Some(pages_str) = line.split_whitespace().nth(1) {
+                        if let Ok(pages) = pages_str.parse::<u32>() {
+                            self.total_pages = pages;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fallback: assume single page if pdfinfo fails
+        self.total_pages = 1;
         Ok(())
     }
     
@@ -390,6 +423,7 @@ impl WysiwygEditor {
         
         // Mark as dirty and rebuild with new layout mode
         self.text_buffer_dirty = true;
+        self.scroll_offset = 0; // Reset scroll when changing modes
         self.rebuild_text_buffer();
         
         Ok(())
@@ -539,12 +573,26 @@ impl WysiwygEditor {
             ""
         };
         
-        let status_text = format!("{} - Page {} - {}% - {} (Ctrl+L){}", 
+        let scroll_info = if !self.ab_mode && self.layout_mode == LayoutMode::Sequential {
+            let total_lines = self.text_buffer.lines().count();
+            let visible_lines = (self.terminal_height - 1) as usize;
+            if total_lines > visible_lines {
+                format!(" - Line {}/{}", self.scroll_offset + 1, total_lines)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        
+        let status_text = format!("{} - Page {}/{} - {}% - {} (Ctrl+L){}{}", 
             self.pdf_path.file_stem().unwrap_or_default().to_string_lossy(),
             self.current_page,
+            self.total_pages,
             self.zoom_level,
             mode_indicator,
-            pane_indicator);
+            pane_indicator,
+            scroll_info);
         
         execute!(
             io::stdout(),
@@ -572,10 +620,24 @@ impl WysiwygEditor {
     
     fn render_text_only(&self) -> Result<()> {
         // Display the text buffer as continuous text (full width)
-        for (i, line) in self.text_buffer.lines().enumerate() {
-            if i < (self.terminal_height - 2) as usize {
-                execute!(io::stdout(), cursor::MoveTo(0, i as u16))?;
-                self.render_line_with_selection(line, i as u16, 0)?;
+        // Calculate how many lines we can show (leave room for status line)
+        let available_lines = (self.terminal_height - 1) as usize;
+        let total_lines: Vec<&str> = self.text_buffer.lines().collect();
+        
+        // Clear the text area
+        for y in 0..available_lines {
+            execute!(io::stdout(), cursor::MoveTo(0, y as u16), Print(" ".repeat(self.terminal_width as usize)))?;
+        }
+        
+        // Render visible lines starting from scroll_offset
+        for (screen_line, text_line_index) in (self.scroll_offset..).enumerate() {
+            if screen_line >= available_lines {
+                break;
+            }
+            
+            if let Some(line) = total_lines.get(text_line_index) {
+                execute!(io::stdout(), cursor::MoveTo(0, screen_line as u16))?;
+                self.render_line_with_selection(line, screen_line as u16, 0)?;
             }
         }
         Ok(())
@@ -955,15 +1017,13 @@ impl WysiwygEditor {
             return self.handle_file_picker_input(key, modifiers);
         }
         
-        // Log key presses and current state
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/chonker95_debug.log")
-            .and_then(|mut file| {
-                use std::io::Write;
-                writeln!(file, "Key: {:?}, AB mode: {}, Active pane: {:?}", key, self.ab_mode, self.active_pane)
-            });
+        // Debug EVERY key press to see what's happening
+        eprintln!("=== KEY PRESS ===");
+        eprintln!("Key: {:?}", key);
+        eprintln!("Modifiers: {:?}", modifiers);
+        eprintln!("AB mode: {}, Active pane: {:?}", self.ab_mode, self.active_pane);
+        eprintln!("Page: {}/{}", self.current_page, self.total_pages);
+        eprintln!("================");
         
         match key {
             // Pane switching
@@ -1070,6 +1130,30 @@ impl WysiwygEditor {
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
             
+            // Global page navigation (works in any mode/pane)
+            KeyCode::Char(';') if modifiers.contains(KeyModifiers::CONTROL) => {
+                eprintln!("CTRL+; pressed - Previous page attempt, current: {}, total: {}", self.current_page, self.total_pages);
+                if self.current_page > 1 {
+                    self.current_page -= 1;
+                    self.load_page()?;
+                    if self.ab_mode {
+                        self.pdf_image_rendered = false;
+                    }
+                    eprintln!("SUCCESS: Changed to page {}", self.current_page);
+                }
+            }
+            KeyCode::Char('\'') if modifiers.contains(KeyModifiers::CONTROL) => {
+                eprintln!("CTRL+' pressed - Next page attempt, current: {}, total: {}", self.current_page, self.total_pages);
+                if self.current_page < self.total_pages {
+                    self.current_page += 1;
+                    self.load_page()?;
+                    if self.ab_mode {
+                        self.pdf_image_rendered = false;
+                    }
+                    eprintln!("SUCCESS: Changed to page {}", self.current_page);
+                }
+            }
+            
             // Text pane controls (only when text pane is active OR not in A-B mode)
             _ if !self.ab_mode || self.active_pane == ActivePane::Text => {
                 self.handle_text_input(key, modifiers)?;
@@ -1133,8 +1217,10 @@ impl WysiwygEditor {
             KeyCode::Right => {
                 if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::SHIFT) {
                     // Ctrl+Right: Next page
-                    self.current_page += 1;
-                    self.load_page()?;
+                    if self.current_page < self.total_pages {
+                        self.current_page += 1;
+                        self.load_page()?;
+                    }
                 } else if modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+Arrow: Extend block selection
                     if !self.is_selecting {
@@ -1197,6 +1283,16 @@ impl WysiwygEditor {
             }
             KeyCode::Char('l') | KeyCode::Char('L') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_layout_mode()?;
+            }
+            KeyCode::PageUp => {
+                if !self.ab_mode {
+                    self.scroll_up()?;
+                }
+            }
+            KeyCode::PageDown => {
+                if !self.ab_mode {
+                    self.scroll_down()?;
+                }
             }
             _ => {}
         }
@@ -1629,6 +1725,7 @@ impl WysiwygEditor {
     fn load_new_file(&mut self, path: PathBuf) -> Result<()> {
         self.pdf_path = path;
         self.current_page = 1;
+        self.total_pages = 1; // Will be updated in load_page
         self.pdf_image_rendered = false;
         self.is_selecting = false;
         self.cursor_x = 0;
@@ -1776,6 +1873,21 @@ impl WysiwygEditor {
         // Clear any active selection
         self.is_selecting = false;
         
+        Ok(())
+    }
+    
+    fn scroll_up(&mut self) -> Result<()> {
+        let page_size = (self.terminal_height - 1) as usize;
+        self.scroll_offset = self.scroll_offset.saturating_sub(page_size);
+        Ok(())
+    }
+    
+    fn scroll_down(&mut self) -> Result<()> {
+        let page_size = (self.terminal_height - 1) as usize;
+        let total_lines = self.text_buffer.lines().count();
+        let max_scroll = total_lines.saturating_sub(page_size);
+        
+        self.scroll_offset = (self.scroll_offset + page_size).min(max_scroll);
         Ok(())
     }
 }
