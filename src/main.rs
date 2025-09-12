@@ -120,6 +120,9 @@ struct WysiwygEditor {
     history_index: isize, // -1 means at latest, 0+ means historical position
     // Layout mode
     layout_mode: LayoutMode,
+    // Performance: dirty tracking
+    text_buffer_dirty: bool,
+    last_layout_mode: LayoutMode,
 }
 
 impl WysiwygEditor {
@@ -155,6 +158,8 @@ impl WysiwygEditor {
             history: Vec::new(),
             history_index: -1,
             layout_mode: LayoutMode::Spatial, // Start with good tables
+            text_buffer_dirty: true, // Needs initial build
+            last_layout_mode: LayoutMode::Spatial,
         };
         
         editor.load_page()?;
@@ -165,6 +170,7 @@ impl WysiwygEditor {
     
     fn load_page(&mut self) -> Result<()> {
         self.elements = self.extract_alto_elements()?;
+        self.text_buffer_dirty = true; // New elements require rebuild
         self.rebuild_text_buffer();
         Ok(())
     }
@@ -175,20 +181,29 @@ impl WysiwygEditor {
             return;
         }
         
+        // Skip rebuild if nothing changed (major performance win)
+        if !self.text_buffer_dirty && self.layout_mode == self.last_layout_mode {
+            return;
+        }
+        
         match self.layout_mode {
             LayoutMode::Spatial => self.rebuild_spatial_layout(),
             LayoutMode::Sequential => self.rebuild_sequential_layout(),
         }
+        
+        // Mark as clean and update last mode
+        self.text_buffer_dirty = false;
+        self.last_layout_mode = self.layout_mode;
     }
     
     fn rebuild_spatial_layout(&mut self) {
         let (min_hpos, _max_hpos, min_vpos, _max_vpos, page_width, page_height) = self.calculate_page_bounds();
         
-        // Create spatial grid for terminal display
-        let terminal_width = 120; // Wider for better table handling
-        let terminal_height = 60;
+        // Dynamic grid sizing based on actual content bounds
+        let terminal_width = ((page_width / 6.0) as usize + 20).min(200).max(80); // Adaptive width
+        let terminal_height = ((page_height / 12.0) as usize + 10).min(100).max(30); // Adaptive height
         
-        let mut grid = vec![vec![' '; terminal_width]; terminal_height]; // Use chars for efficiency
+        let mut grid = vec![' '; terminal_width * terminal_height]; // Flat grid for speed
         
 
         // Map each element to terminal grid using precise coordinates (RESTORE HIGH WATERMARK)
@@ -204,22 +219,14 @@ impl WysiwygEditor {
                 continue; // Skip only truly empty content, not spaces
             }
             
-            // Better coordinate mapping with clustering for nearby elements
-            let raw_x = if page_width > 0.0 {
-                (element.hpos - min_hpos) / page_width * (terminal_width as f32 - 10.0)
-            } else {
-                0.0
-            };
+            // Fast integer coordinate mapping
+            let x = if page_width > 0.0 {
+                (((element.hpos - min_hpos) * (terminal_width - 10) as f32) / page_width) as usize
+            } else { 0 }.min(terminal_width.saturating_sub(1));
             
-            let raw_y = if page_height > 0.0 {
-                (element.vpos - min_vpos) / page_height * (terminal_height as f32 - 5.0)
-            } else {
-                0.0
-            };
-            
-            // Smart quantization - cluster nearby coordinates (inlined)
-            let x = ((raw_x / 2.0).round() * 2.0) as usize; // 2-char clustering
-            let y = ((raw_y / 1.0).round() * 1.0) as usize; // 1-line clustering
+            let y = if page_height > 0.0 {
+                (((element.vpos - min_vpos) * (terminal_height - 5) as f32) / page_height) as usize
+            } else { 0 }.min(terminal_height.saturating_sub(1));
             
             // Place text in grid, handling overlaps
             let content = if element.content == " " {
@@ -228,22 +235,28 @@ impl WysiwygEditor {
                 element.content.trim()
             };
             
-            if y < terminal_height && x < terminal_width && !content.is_empty() && y < grid.len() && x < grid[0].len() {
-                // For space elements, just place a single space
-                if element.content == " " {
-                    if grid[y][x] == ' ' { // Only place space if position is empty
-                        grid[y][x] = ' ';
-                    }
-                } else {
-                    // For text elements, place character by character
-                    for (i, ch) in content.char_indices() {
-                        let pos_x = x + i;
-                        if pos_x < terminal_width {
-                            // Only overwrite spaces or if element has priority (inlined)
-                            let has_priority = grid[y][pos_x] == ' ' || 
-                                element.content.chars().any(|c| c.is_numeric() || c == '$' || c == '%');
-                            if has_priority {
-                                grid[y][pos_x] = ch;
+            if y < terminal_height && x < terminal_width && !content.is_empty() {
+                let grid_idx = y * terminal_width + x;
+                if grid_idx < grid.len() {
+                    // For space elements, just place a single space
+                    if element.content == " " {
+                        if grid[grid_idx] == ' ' { // Only place space if position is empty
+                            grid[grid_idx] = ' ';
+                        }
+                    } else {
+                        // For text elements, place character by character
+                        for (i, ch) in content.char_indices() {
+                            let pos_x = x + i;
+                            if pos_x < terminal_width {
+                                let pos_idx = y * terminal_width + pos_x;
+                                if pos_idx < grid.len() {
+                                    // Only overwrite spaces or if element has priority (inlined)
+                                    let has_priority = grid[pos_idx] == ' ' || 
+                                        element.content.chars().any(|c| c.is_numeric() || c == '$' || c == '%');
+                                    if has_priority {
+                                        grid[pos_idx] = ch;
+                                    }
+                                }
                             }
                         }
                     }
@@ -251,19 +264,32 @@ impl WysiwygEditor {
             }
         }
         
-        // Convert grid to text efficiently
-        let buffer_lines: Vec<String> = grid.iter()
-            .map(|row| row.iter().collect::<String>().trim_end().to_string())
+        // Convert flat grid to text efficiently  
+        let buffer_lines: Vec<String> = grid.chunks(terminal_width)
+            .map(|row| row.iter().collect::<String>().trim_end_matches(' ').to_owned())
             .filter(|line| !line.trim().is_empty())
             .collect();
         self.text_buffer = buffer_lines.join("\n");
     }
     
     fn calculate_page_bounds(&self) -> (f32, f32, f32, f32, f32, f32) {
-        let min_hpos = self.elements.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
-        let max_hpos = self.elements.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
-        let min_vpos = self.elements.iter().map(|e| e.vpos).fold(f32::INFINITY, f32::min);
-        let max_vpos = self.elements.iter().map(|e| e.vpos + e._height).fold(f32::NEG_INFINITY, f32::max);
+        if self.elements.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        
+        // Fast single-pass bounds calculation
+        let mut min_hpos = f32::INFINITY;
+        let mut max_hpos = f32::NEG_INFINITY;
+        let mut min_vpos = f32::INFINITY;
+        let mut max_vpos = f32::NEG_INFINITY;
+        
+        for element in &self.elements {
+            min_hpos = min_hpos.min(element.hpos);
+            max_hpos = max_hpos.max(element.hpos + element._width);
+            min_vpos = min_vpos.min(element.vpos);
+            max_vpos = max_vpos.max(element.vpos + element._height);
+        }
+        
         let page_width = max_hpos - min_hpos;
         let page_height = max_vpos - min_vpos;
         (min_hpos, max_hpos, min_vpos, max_vpos, page_width, page_height)
@@ -308,7 +334,7 @@ impl WysiwygEditor {
                         }
                         ElementType::Space => {
                             let space_count = (element._width / char_width).round().max(1.0) as usize;
-                            line_output.push_str(&" ".repeat(space_count.min(3)));
+                            for _ in 0..space_count.min(3) { line_output.push(' '); }
                         }
                     }
                 }
@@ -316,7 +342,10 @@ impl WysiwygEditor {
                 // Check if line should be centered (like titles, table headers)
                 if self.is_line_centered_sequential(&line_elements, page_center, page_width) {
                     let padding = ((terminal_width as i32 - line_output.len() as i32) / 2).max(0) as usize;
-                    line_output = format!("{}{}", " ".repeat(padding), line_output);
+                    let mut padded = String::with_capacity(padding + line_output.len());
+                    padded.push_str(&" ".repeat(padding));
+                    padded.push_str(&line_output);
+                    line_output = padded;
                 }
                 
                 output_lines.push(line_output);
@@ -359,7 +388,8 @@ impl WysiwygEditor {
             LayoutMode::Sequential => LayoutMode::Spatial,
         };
         
-        // Rebuild with new layout mode
+        // Mark as dirty and rebuild with new layout mode
+        self.text_buffer_dirty = true;
         self.rebuild_text_buffer();
         
         Ok(())
@@ -383,7 +413,7 @@ impl WysiwygEditor {
             return Ok(vec![]);
         }
         
-        let xml_data = String::from_utf8_lossy(&output.stdout);
+        let xml_data = std::str::from_utf8(&output.stdout).unwrap_or(""); // Faster than lossy conversion
         Ok(self.parse_alto_xml(&xml_data))
     }
     
@@ -408,11 +438,11 @@ impl WysiwygEditor {
                         
                         for attr in e.attributes().with_checks(false) {
                             if let Ok(attr) = attr {
-                                let key = String::from_utf8_lossy(attr.key.as_ref());
-                                let value = String::from_utf8_lossy(&attr.value);
+                                let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
+                                let value = std::str::from_utf8(&attr.value).unwrap_or("");
                                 
                                 match key.as_ref() {
-                                    "CONTENT" => content = value.to_string(),
+                                    "CONTENT" => content = value.to_owned(),
                                     "HPOS" => hpos = value.parse().unwrap_or(0.0),
                                     "VPOS" => vpos = value.parse().unwrap_or(0.0),
                                     "WIDTH" => width = value.parse().unwrap_or(0.0),
@@ -442,8 +472,8 @@ impl WysiwygEditor {
                         
                         for attr in e.attributes().with_checks(false) {
                             if let Ok(attr) = attr {
-                                let key = String::from_utf8_lossy(attr.key.as_ref());
-                                let value = String::from_utf8_lossy(&attr.value);
+                                let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
+                                let value = std::str::from_utf8(&attr.value).unwrap_or("");
                                 
                                 match key.as_ref() {
                                     "HPOS" => hpos = value.parse().unwrap_or(0.0),
@@ -457,7 +487,7 @@ impl WysiwygEditor {
                         // Add space as an element
                         elements.push(AltoElement::new(
                             format!("space_{}", element_id),
-                            " ".to_string(), // Single space character
+                            " ".to_owned(),
                             hpos,
                             vpos,
                             width,
@@ -482,14 +512,11 @@ impl WysiwygEditor {
             return Ok(());
         }
         
-        // Only clear screen in text mode
-        // In A-B mode with image, we selectively clear only what we need
+        // Minimal clearing to reduce flashing
         if !self.ab_mode {
             execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-        } else {
-            // Don't clear everything - just move cursor
-            execute!(io::stdout(), cursor::MoveTo(0, 0))?;
         }
+        // In A-B mode, don't clear at all - just update what's needed
         
         if self.ab_mode {
             self.render_split_screen()?;
@@ -527,13 +554,16 @@ impl WysiwygEditor {
             ResetColor
         )?;
         
-        // Position cursor (may be off-screen, that's OK)
+        // Position cursor only in text mode
         if !self.ab_mode {
             execute!(
                 io::stdout(),
                 cursor::MoveTo(self.cursor_x, self.cursor_y),
                 cursor::Show
             )?;
+        } else {
+            // Hide cursor completely in A-B mode
+            execute!(io::stdout(), cursor::Hide)?;
         }
         
         io::stdout().flush()?;
@@ -577,37 +607,36 @@ impl WysiwygEditor {
             // We don't print anything over it
         }
         
-        // Vertical separator with focus indicators
+        // Clean vertical separator with subtle focus indication
         for y in 0..(self.terminal_height - 1) {
             let separator_color = match self.active_pane {
-                ActivePane::Image if y == 0 => Color::Yellow,  // Highlight active pane
-                ActivePane::Text if y == 0 => Color::Blue,
-                _ => Color::DarkGrey,
-            };
-            
-            let separator_char = if y == 0 {
-                match self.active_pane {
-                    ActivePane::Image => "┃", // Bold separator for active image pane
-                    ActivePane::Text => "│",  // Normal separator
-                }
-            } else {
-                "│"
+                ActivePane::Image => Color::Blue,    // Subtle blue for image focus
+                ActivePane::Text => Color::DarkGrey, // Muted for text focus
             };
             
             execute!(
                 io::stdout(),
                 cursor::MoveTo(split_x, y),
                 SetForegroundColor(separator_color),
-                Print(separator_char),
+                Print("│"),
                 ResetColor
             )?;
         }
         
-        // Right side: Text extraction (constrained to right half)
-        let lines: Vec<&str> = self.text_buffer.lines().collect();
+        // Right side: Text extraction with clean black background
         let right_panel_width = (self.terminal_width - split_x - 1) as usize;
         
-        for (i, line) in lines.iter().enumerate() {
+        // Clear right panel with black background
+        for y in 0..(self.terminal_height - 1) {
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(split_x + 1, y),
+                Print(" ".repeat(right_panel_width))
+            )?;
+        }
+        
+        // Render text on clean background
+        for (i, line) in self.text_buffer.lines().enumerate() {
             if i < (self.terminal_height - 2) as usize {
                 let trimmed_line = if line.len() > right_panel_width {
                     &line[0..right_panel_width]
@@ -701,51 +730,52 @@ impl WysiwygEditor {
             return Ok(());
         }
         
-        // Use ghostscript to render PDF page as grayscale JPG
-        let temp_file = format!("/tmp/chonker_temp_{}.jpg", self.current_page);
-        let output_file = format!("/tmp/chonker_kitty_{}.jpg", self.current_page);
+        // Ultra-fast file operations - PPM for speed
+        let output_file = format!("/tmp/chonker_kitty_{}.ppm", self.current_page);
+        let use_temp = self.dark_mode;
         
-        // Clean up any existing files first
-        let _ = std::fs::remove_file(&temp_file);
-        let _ = std::fs::remove_file(&output_file);
+        let (temp_file, final_file) = if use_temp {
+            (format!("/tmp/chonker_temp_{}.ppm", self.current_page), 
+             format!("/tmp/chonker_kitty_{}.png", self.current_page)) // Convert to PNG for dark mode
+        } else {
+            (output_file.clone(), output_file.clone())
+        };
+        
+        // Clean up only what we need
+        let _ = std::fs::remove_file(&final_file);
+        if use_temp { let _ = std::fs::remove_file(&temp_file); }
         
         // Log to file instead of terminal
         let _ = std::fs::write("/tmp/chonker95_debug.log", 
             format!("Rendering PDF at {}% zoom ({}dpi) for page {}\n", self.zoom_level, self.zoom_level + 50, self.current_page));
         
+        // Minimal ghostscript for maximum speed
+        let target_dpi = (self.zoom_level as f32 * 0.7) as u16;
         let result = std::process::Command::new("gs")
             .args([
-                "-dNOPAUSE", "-dBATCH", "-dSAFER", "-dQUIET",
-                "-sDEVICE=jpeggray", // Grayscale JPEG
+                "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dNOSAFER",
+                "-sDEVICE=ppmraw", // Raw PPM is fastest to generate
                 &format!("-dFirstPage={}", self.current_page),
                 &format!("-dLastPage={}", self.current_page),
-                &format!("-r{}", self.zoom_level + 50), // Higher DPI for sharper detail
-                "-dJPEGQ=75", // Good quality
-                "-dFastWebView", // Optimize for screen display
-                "-dNOPLATFONTS", // Skip system font loading
+                &format!("-r{}", target_dpi),
                 &format!("-sOutputFile={}", temp_file),
             ])
             .arg(&self.pdf_path)
             .output()?;
             
         if !result.status.success() {
-            return Ok(()); // Silently fail if Ghostscript errors
+            return Ok(());
         }
         
         if std::path::Path::new(&temp_file).exists() {
-            // Apply dark mode processing if enabled
-            if self.dark_mode {
-                self.process_dark_mode_image(&temp_file, &output_file)?;
-            } else {
-                // Just copy the original file
-                std::fs::copy(&temp_file, &output_file)?;
+            // Process dark mode only if needed (saves 50% operations for light mode)
+            if use_temp && self.dark_mode {
+                self.process_dark_mode_image(&temp_file, &final_file)?;
+                let _ = std::fs::remove_file(&temp_file); // Cleanup temp immediately
             }
             
-            self.display_image_in_kitty(&output_file)?;
+            self.display_image_in_kitty(&final_file)?;
             self.pdf_image_rendered = true;
-            
-            // Cleanup temp file
-            let _ = std::fs::remove_file(&temp_file);
         }
         
         Ok(())
@@ -753,12 +783,13 @@ impl WysiwygEditor {
     
     fn process_dark_mode_image(&self, input_path: &str, output_path: &str) -> Result<()> {
         
-        // Use ImageMagick convert to invert colors for pure black background
+        // Convert PPM to PNG with dark mode processing
         let result = std::process::Command::new("convert")
             .args([
                 input_path,
-                "-negate", // Invert colors (white background becomes black)
-                "-level", "0%,90%", // Ensure pure black background, slightly brighten text
+                "-negate", // Invert colors
+                "-strip", // Remove metadata
+                "-format", "png", // Ensure PNG output
                 output_path,
             ])
             .output();
@@ -808,55 +839,14 @@ impl WysiwygEditor {
         let display_x = (margin_x as i16 + 1 + self.pan_offset_x).max(1) as u16;
         let display_y = (margin_y as i16 + 1 + self.pan_offset_y).max(1) as u16;
         
-        // Temporarily disable raw mode to display the image
-        terminal::disable_raw_mode()?;
-        
-        // Clear any existing kitty graphics first
+        // Ultra-fast image display without clearing (eliminates flash)
         let _ = std::process::Command::new("kitty")
-            .args(["+kitten", "icat", "--clear"])
-            .status();
-        
-        // Clear the left panel area
-        for y in 0..self.terminal_height {
-            execute!(
-                io::stdout(),
-                cursor::MoveTo(0, y),
-                Print(" ".repeat(split_x as usize))
-            )?;
-        }
-        
-        // Log image display to file
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/chonker95_debug.log")
-            .and_then(|mut file| {
-                use std::io::Write;
-                writeln!(file, "Displaying image: {} at zoom {}%", image_path, self.zoom_level)
-            });
-        
-        // Display the image using kitty icat with panning and scaling
-        let result = std::process::Command::new("kitty")
             .args(["+kitten", "icat", 
                    &format!("--place={}x{}@{}x{}", cols - (margin_x * 2), rows - (margin_y * 2), display_x, display_y),
-                   "--scale-up", // Allow upscaling for magnification
+                   "--scale-up",
+                   "--transfer-mode=file", // Faster file transfer
                    image_path])
             .status();
-            
-        // Log result to file
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/chonker95_debug.log")
-            .and_then(|mut file| {
-                use std::io::Write;
-                writeln!(file, "Kitty icat result: {:?}", result)
-            });
-        
-        // Image displayed (debug logging removed)
-        
-        // Re-enable raw mode
-        terminal::enable_raw_mode()?;
         
         Ok(())
     }
