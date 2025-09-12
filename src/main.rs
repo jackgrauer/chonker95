@@ -9,6 +9,7 @@ use crossterm::{
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -23,15 +24,15 @@ struct Cli {
 
 #[derive(Debug, Clone)]
 struct AltoElement {
-    id: String,
+    _id: String,
     content: String,
     hpos: f32,
     vpos: f32,
-    width: f32,
-    height: f32,
+    _width: f32,
+    _height: f32,
     // Screen position (calculated from PDF coordinates)
-    screen_x: u16,
-    screen_y: u16,
+    _screen_x: u16,
+    _screen_y: u16,
 }
 
 impl AltoElement {
@@ -40,14 +41,14 @@ impl AltoElement {
         let screen_y = (vpos / 12.0) as u16;
         
         Self {
-            id,
+            _id: id,
             content,
             hpos,
             vpos,
-            width,
-            height,
-            screen_x,
-            screen_y,
+            _width: width,
+            _height: height,
+            _screen_x: screen_x,
+            _screen_y: screen_y,
         }
     }
 }
@@ -212,7 +213,14 @@ impl WysiwygEditor {
     }
     
     fn render(&self) -> Result<()> {
-        execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        // Only clear screen in text mode
+        // In A-B mode with image, we selectively clear only what we need
+        if !self.ab_mode {
+            execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        } else {
+            // Don't clear everything - just move cursor
+            execute!(io::stdout(), cursor::MoveTo(0, 0))?;
+        }
         
         if self.ab_mode {
             self.render_split_screen()?;
@@ -266,7 +274,7 @@ impl WysiwygEditor {
     fn render_split_screen(&self) -> Result<()> {
         let split_x = self.terminal_width / 2;
         
-        // Left side: PDF image area with debug info
+        // Left side: PDF image area 
         if !self.pdf_image_rendered {
             execute!(
                 io::stdout(),
@@ -284,17 +292,9 @@ impl WysiwygEditor {
                 ResetColor
             )?;
         } else {
-            execute!(
-                io::stdout(),
-                cursor::MoveTo(2, 2),
-                SetForegroundColor(Color::Green),
-                Print("PDF IMAGE SHOULD BE HERE"),
-                ResetColor,
-                cursor::MoveTo(2, 3),
-                SetForegroundColor(Color::Green),
-                Print("(kitty graphics rendered)"),
-                ResetColor
-            )?;
+            // Don't overwrite the image area - it should be displayed
+            // The image is rendered at position 0,0 and takes up the left panel
+            // We don't print anything over it
         }
         
         // Vertical separator
@@ -335,21 +335,23 @@ impl WysiwygEditor {
             return Ok(());
         }
         
-        // Use ghostscript to render PDF page  
-        let temp_file = format!("/tmp/chonker_kitty_{}", self.current_page);
-        let output_file = format!("{}.jpg", temp_file);
+        // Use ghostscript to render PDF page as grayscale JPG
+        let output_file = format!("/tmp/chonker_kitty_{}.jpg", self.current_page);
+        
+        // Clean up any existing file first
+        let _ = std::fs::remove_file(&output_file);
         
         // Debug: Show what command we're running
-        eprintln!("DEBUG: Running ghostscript for page {}", self.current_page);
+        eprintln!("DEBUG: Running ghostscript for page {} -> {}", self.current_page, output_file);
         
         let result = std::process::Command::new("gs")
             .args([
-                "-dNOPAUSE", "-dBATCH", "-dSAFER",
-                "-sDEVICE=jpeggray", // Grayscale JPEG for smaller size
+                "-dNOPAUSE", "-dBATCH", "-dSAFER", "-dQUIET",
+                "-sDEVICE=jpeggray", // Grayscale JPEG
                 &format!("-dFirstPage={}", self.current_page),
                 &format!("-dLastPage={}", self.current_page),
-                "-r100", // Lower resolution for speed and size
-                "-dJPEGQ=80", // Good quality, smaller size
+                "-r150", // Good resolution for terminal display
+                "-dJPEGQ=85", // High quality grayscale
                 &format!("-sOutputFile={}", output_file),
             ])
             .arg(&self.pdf_path)
@@ -362,56 +364,104 @@ impl WysiwygEditor {
         
         if std::path::Path::new(&output_file).exists() {
             let file_size = std::fs::metadata(&output_file)?.len();
-            eprintln!("DEBUG: PNG created: {} ({} bytes)", output_file, file_size);
+            eprintln!("DEBUG: JPG created: {} ({} bytes)", output_file, file_size);
             
-            // Don't delete the file so we can test it manually
             self.display_image_in_kitty(&output_file)?;
             self.pdf_image_rendered = true;
         } else {
-            eprintln!("DEBUG: PNG file not created: {}", output_file);
+            eprintln!("DEBUG: JPG file not created: {}", output_file);
         }
         
         Ok(())
     }
     
     fn display_image_in_kitty(&self, image_path: &str) -> Result<()> {
-        // For ghostty terminal, try direct file display using kitty icat equivalent
+        // Check if we're actually in kitty terminal
+        if !self.is_kitty_terminal() {
+            return self.fallback_image_display(image_path);
+        }
+        
+        // Check if the image file exists
+        if !std::path::Path::new(image_path).exists() {
+            eprintln!("Image file not found: {}", image_path);
+            return Ok(());
+        }
+        
         let split_x = self.terminal_width / 2;
-        let cols = split_x - 2;
-        let rows = self.terminal_height - 3;
+        let cols = (split_x - 1).max(10);
+        let rows = (self.terminal_height - 2).max(10);
         
-        // Position cursor at top-left of left panel
-        execute!(io::stdout(), cursor::MoveTo(0, 0))?;
+        // Temporarily disable raw mode to display the image
+        terminal::disable_raw_mode()?;
         
-        // For Ghostty: Try external image viewer as fallback
+        // Clear the left panel area
+        for y in 0..self.terminal_height {
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(0, y),
+                Print(" ".repeat(split_x as usize))
+            )?;
+        }
+        
+        // Display the image using kitty icat
+        let _ = std::process::Command::new("kitty")
+            .args(["+kitten", "icat", "--clear", 
+                   &format!("--place={}x{}@1x1", cols, rows),
+                   image_path])
+            .status();
+        
+        // Log what we did
+        let _ = std::fs::write("/tmp/chonker_debug.log", 
+            format!("Image displayed: {}\nDimensions: {}x{} at position 1,1\n", 
+                   image_path, cols, rows));
+        
+        // Re-enable raw mode
+        terminal::enable_raw_mode()?;
+        
+        Ok(())
+    }
+    
+    fn is_kitty_terminal(&self) -> bool {
+        // Check multiple environment variables for Kitty detection
+        // KITTY_WINDOW_ID is the most reliable indicator
+        if std::env::var("KITTY_WINDOW_ID").is_ok() {
+            return true;
+        }
+        
+        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+        let term = std::env::var("TERM").unwrap_or_default();
+        
+        term_program == "kitty" || term.contains("kitty") || term == "xterm-kitty"
+    }
+    
+    fn fallback_image_display(&self, image_path: &str) -> Result<()> {
+        // Fallback for non-kitty terminals
         let result = std::process::Command::new("open")
             .args(["-a", "Preview", image_path])
             .spawn();
             
         match result {
             Ok(_) => {
-                // External viewer launched
                 execute!(
                     io::stdout(),
-                    cursor::MoveTo(2, 8),
-                    SetForegroundColor(Color::Green),
-                    Print("PDF opened in Preview"),
-                    ResetColor,
-                    cursor::MoveTo(2, 9),
+                    cursor::MoveTo(2, 2),
                     SetForegroundColor(Color::Yellow),
-                    Print("(Ghostty doesn't support kitty graphics)"),
+                    Print("PDF opened in external viewer"),
+                    ResetColor,
+                    cursor::MoveTo(2, 3),
+                    SetForegroundColor(Color::Yellow),
+                    Print("(Terminal doesn't support kitty graphics)"),
                     ResetColor
                 )?;
             }
             Err(_) => {
-                // Show file path for manual viewing
                 execute!(
                     io::stdout(),
-                    cursor::MoveTo(2, 8),
+                    cursor::MoveTo(2, 2),
                     SetForegroundColor(Color::Red),
                     Print("No image display available"),
                     ResetColor,
-                    cursor::MoveTo(2, 9),
+                    cursor::MoveTo(2, 3),
                     SetForegroundColor(Color::Yellow),
                     Print(format!("File: {}", image_path)),
                     ResetColor
@@ -493,6 +543,9 @@ impl WysiwygEditor {
                 self.ab_mode = !self.ab_mode;
                 if self.ab_mode {
                     self.pdf_image_rendered = false; // Force re-render for A-B mode
+                } else {
+                    // Clear screen when exiting A-B mode
+                    execute!(io::stdout(), Clear(ClearType::All))?;
                 }
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
@@ -568,9 +621,9 @@ impl WysiwygEditor {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
-    // Setup terminal
+    // Setup terminal - NO alternate screen since it conflicts with kitty graphics
     terminal::enable_raw_mode()?;
-    execute!(io::stdout(), terminal::EnterAlternateScreen, event::EnableMouseCapture)?;
+    execute!(io::stdout(), event::EnableMouseCapture)?;
     
     let mut editor = WysiwygEditor::new(cli.file, cli.page)?;
     
@@ -603,8 +656,9 @@ fn main() -> Result<()> {
     // Cleanup terminal
     execute!(
         io::stdout(),
-        terminal::LeaveAlternateScreen,
-        event::DisableMouseCapture
+        event::DisableMouseCapture,
+        Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
     )?;
     terminal::disable_raw_mode()?;
     
