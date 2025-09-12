@@ -93,6 +93,9 @@ struct WysiwygEditor {
     // Image viewport panning
     pan_offset_x: i16,
     pan_offset_y: i16,
+    // Undo/redo system
+    history: Vec<String>,
+    history_index: isize, // -1 means at latest, 0+ means historical position
 }
 
 impl WysiwygEditor {
@@ -125,9 +128,13 @@ impl WysiwygEditor {
             active_pane: ActivePane::Text, // Start with text editing focused
             pan_offset_x: 0,
             pan_offset_y: 0,
+            history: Vec::new(),
+            history_index: -1,
         };
         
         editor.load_page()?;
+        // Save initial state to history
+        editor.save_to_history();
         Ok(editor)
     }
     
@@ -1018,6 +1025,17 @@ impl WysiwygEditor {
             KeyCode::Char('v') | KeyCode::Char('V') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.paste_clipboard()?;
             }
+            KeyCode::Char('t') | KeyCode::Char('T') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.is_selecting {
+                    self.format_selection_as_table()?;
+                }
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.undo()?;
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.redo()?;
+            }
             _ => {}
         }
         
@@ -1025,6 +1043,8 @@ impl WysiwygEditor {
     }
     
     fn insert_char_at_cursor(&mut self, c: char) -> Result<()> {
+        // Save state before modifying
+        self.save_to_history();
         let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
         
         // Ensure we have enough lines for cursor position
@@ -1059,6 +1079,8 @@ impl WysiwygEditor {
     }
     
     fn delete_char_at_cursor(&mut self) -> Result<()> {
+        // Save state before modifying
+        self.save_to_history();
         if self.cursor_x > 0 {
             let lines: Vec<&str> = self.text_buffer.lines().collect();
             let mut new_buffer = String::new();
@@ -1119,7 +1141,7 @@ impl WysiwygEditor {
         }
         
         let lines: Vec<&str> = self.text_buffer.lines().collect();
-        self.clipboard.clear();
+        let mut clipboard_text = String::new();
         
         // Normalize selection bounds
         let (start_y, end_y) = if self.selection_start_y <= self.selection_end_y {
@@ -1135,6 +1157,7 @@ impl WysiwygEditor {
         };
         
         // Extract the selected block of text
+        let mut clipboard_lines = Vec::new();
         for y in start_y..=end_y {
             if (y as usize) < lines.len() {
                 let line = lines[y as usize];
@@ -1148,12 +1171,21 @@ impl WysiwygEditor {
                         selected_part.push(' '); // Fill spaces for rectangular selection
                     }
                 }
-                self.clipboard.push(selected_part);
+                clipboard_lines.push(selected_part.trim_end().to_string());
             } else {
                 // Empty line in selection
-                let width = (end_x - start_x + 1) as usize;
-                self.clipboard.push(" ".repeat(width));
+                clipboard_lines.push("".to_string());
             }
+        }
+        
+        clipboard_text = clipboard_lines.join("\n");
+        
+        // Copy to both internal and system clipboard
+        self.clipboard = clipboard_lines;
+        
+        // Copy to system clipboard
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_text(clipboard_text);
         }
         
         Ok(())
@@ -1222,19 +1254,33 @@ impl WysiwygEditor {
     }
     
     fn paste_clipboard(&mut self) -> Result<()> {
-        if self.clipboard.is_empty() {
+        // Save state before modifying
+        self.save_to_history();
+        // Try system clipboard first, fallback to internal
+        let clipboard_content = if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            clipboard.get_text().unwrap_or_else(|_| {
+                // Fallback to internal clipboard
+                self.clipboard.join("\n")
+            })
+        } else {
+            // Fallback to internal clipboard
+            self.clipboard.join("\n")
+        };
+        
+        if clipboard_content.is_empty() {
             return Ok(());
         }
         
+        let clipboard_lines: Vec<&str> = clipboard_content.lines().collect();
         let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
         
         // Ensure we have enough lines for the paste operation
-        while lines.len() <= (self.cursor_y as usize + self.clipboard.len()) {
+        while lines.len() <= (self.cursor_y as usize + clipboard_lines.len()) {
             lines.push(String::new());
         }
         
         // Paste each line from clipboard starting at cursor position
-        for (i, clipboard_line) in self.clipboard.iter().enumerate() {
+        for (i, clipboard_line) in clipboard_lines.iter().enumerate() {
             let target_y = self.cursor_y as usize + i;
             if target_y < lines.len() {
                 let line = &mut lines[target_y];
@@ -1491,6 +1537,292 @@ impl WysiwygEditor {
                 self.render_pdf_image()?;
             }
         }
+        
+        Ok(())
+    }
+    
+    fn format_selection_as_table(&mut self) -> Result<()> {
+        if !self.is_selecting {
+            return Ok(());
+        }
+        
+        // Save state before modifying
+        self.save_to_history();
+        
+        // Get the selected text and its spatial structure
+        let selected_text = self.get_selected_text();
+        let formatted_table = self.spatial_table_format(&selected_text);
+        
+        // Replace selection with formatted table
+        self.replace_selection_with_text(&formatted_table)?;
+        
+        // Clear selection
+        self.is_selecting = false;
+        
+        Ok(())
+    }
+    
+    fn get_selected_text(&self) -> String {
+        let lines: Vec<&str> = self.text_buffer.lines().collect();
+        let mut selected_text = String::new();
+        
+        // Normalize selection bounds
+        let (start_y, end_y) = if self.selection_start_y <= self.selection_end_y {
+            (self.selection_start_y, self.selection_end_y)
+        } else {
+            (self.selection_end_y, self.selection_start_y)
+        };
+        
+        let (start_x, end_x) = if self.selection_start_x <= self.selection_end_x {
+            (self.selection_start_x, self.selection_end_x)
+        } else {
+            (self.selection_end_x, self.selection_start_x)
+        };
+        
+        // Extract selected block maintaining spatial relationships
+        for y in start_y..=end_y {
+            if (y as usize) < lines.len() {
+                let line = lines[y as usize];
+                let line_chars: Vec<char> = line.chars().collect();
+                
+                let mut row_text = String::new();
+                for x in start_x..=end_x {
+                    if (x as usize) < line_chars.len() {
+                        row_text.push(line_chars[x as usize]);
+                    } else {
+                        row_text.push(' ');
+                    }
+                }
+                
+                if !row_text.trim().is_empty() {
+                    selected_text.push_str(&row_text.trim_end());
+                    selected_text.push('\n');
+                }
+            }
+        }
+        
+        selected_text
+    }
+    
+    fn spatial_table_format(&self, text: &str) -> String {
+        // Simple but effective table detection using spatial layout
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        
+        if lines.len() < 2 {
+            return text.to_string(); // Not enough data for a table
+        }
+        
+        // Try to detect columns by finding consistent spacing patterns
+        let mut table_rows = Vec::new();
+        
+        for line in &lines {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if words.len() > 1 {
+                table_rows.push(words.iter().map(|w| w.to_string()).collect::<Vec<String>>());
+            }
+        }
+        
+        if table_rows.is_empty() {
+            return text.to_string();
+        }
+        
+        // Calculate column widths
+        let max_cols = table_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut col_widths = vec![8; max_cols];
+        
+        for row in &table_rows {
+            for (i, cell) in row.iter().enumerate() {
+                if i < col_widths.len() {
+                    col_widths[i] = col_widths[i].max(cell.len() + 2);
+                }
+            }
+        }
+        
+        // Format with Unicode borders
+        let mut output = String::new();
+        
+        // Top border
+        output.push_str("┌");
+        for (i, width) in col_widths.iter().enumerate() {
+            output.push_str(&"─".repeat(*width));
+            if i < col_widths.len() - 1 {
+                output.push_str("┬");
+            }
+        }
+        output.push_str("┐\n");
+        
+        // Rows
+        for (row_idx, row) in table_rows.iter().enumerate() {
+            output.push_str("│");
+            for (i, cell) in row.iter().enumerate() {
+                let width = col_widths.get(i).unwrap_or(&10);
+                if self.is_table_number(cell) {
+                    output.push_str(&format!(" {:>width$} │", cell, width = width - 2));
+                } else {
+                    output.push_str(&format!(" {:<width$} │", cell, width = width - 2));
+                }
+            }
+            output.push('\n');
+            
+            // Add separator after first row if it looks like headers
+            if row_idx == 0 && self.looks_like_headers(&row) {
+                output.push_str("├");
+                for (i, width) in col_widths.iter().enumerate() {
+                    output.push_str(&"─".repeat(*width));
+                    if i < col_widths.len() - 1 {
+                        output.push_str("┼");
+                    }
+                }
+                output.push_str("┤\n");
+            }
+        }
+        
+        // Bottom border
+        output.push_str("└");
+        for (i, width) in col_widths.iter().enumerate() {
+            output.push_str(&"─".repeat(*width));
+            if i < col_widths.len() - 1 {
+                output.push_str("┴");
+            }
+        }
+        output.push_str("┘\n");
+        
+        output
+    }
+    
+    fn looks_like_headers(&self, row: &[String]) -> bool {
+        // Headers typically have years or text labels, not all numbers
+        let has_years = row.iter().any(|cell| {
+            cell.len() == 4 && cell.parse::<i32>().map_or(false, |y| y >= 1900 && y <= 2100)
+        });
+        let has_text = row.iter().any(|cell| !self.is_table_number(cell));
+        
+        has_years || has_text
+    }
+    
+    fn is_table_number(&self, text: &str) -> bool {
+        text.starts_with('$') || 
+        text.ends_with('%') || 
+        text.parse::<f64>().is_ok() ||
+        text == "N/A"
+    }
+    
+    fn replace_selection_with_text(&mut self, new_text: &str) -> Result<()> {
+        // First delete the selected area
+        self.delete_selection()?;
+        
+        // Then insert the new table at cursor position
+        let table_lines: Vec<&str> = new_text.lines().collect();
+        let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
+        
+        // Ensure we have enough lines
+        while lines.len() <= (self.cursor_y as usize + table_lines.len()) {
+            lines.push(String::new());
+        }
+        
+        // Insert table lines
+        for (i, table_line) in table_lines.iter().enumerate() {
+            let target_y = self.cursor_y as usize + i;
+            if target_y < lines.len() {
+                let line = &mut lines[target_y];
+                let mut line_chars: Vec<char> = line.chars().collect();
+                
+                // Extend line with spaces if cursor is beyond current text
+                while line_chars.len() < self.cursor_x as usize {
+                    line_chars.push(' ');
+                }
+                
+                // Replace text starting at cursor position
+                let start_pos = self.cursor_x as usize;
+                let table_chars: Vec<char> = table_line.chars().collect();
+                
+                // Ensure line is long enough
+                while line_chars.len() < start_pos + table_chars.len() {
+                    line_chars.push(' ');
+                }
+                
+                // Replace characters
+                for (j, &ch) in table_chars.iter().enumerate() {
+                    line_chars[start_pos + j] = ch;
+                }
+                
+                *line = line_chars.into_iter().collect();
+            }
+        }
+        
+        self.text_buffer = lines.join("\n");
+        
+        Ok(())
+    }
+    
+    fn save_to_history(&mut self) {
+        // Truncate history if we're not at the latest position
+        if self.history_index >= 0 {
+            let keep_until = (self.history_index + 1) as usize;
+            self.history.truncate(keep_until);
+        }
+        
+        // Add current state to history
+        self.history.push(self.text_buffer.clone());
+        
+        // Limit history size to prevent memory issues
+        const MAX_HISTORY: usize = 50;
+        if self.history.len() > MAX_HISTORY {
+            self.history.remove(0);
+        }
+        
+        // Reset to latest position
+        self.history_index = -1;
+    }
+    
+    fn undo(&mut self) -> Result<()> {
+        if self.history.is_empty() {
+            return Ok(());
+        }
+        
+        // If we're at the latest state, save it before going back
+        if self.history_index == -1 {
+            // We're at current state, move to previous
+            self.history_index = (self.history.len() - 1) as isize;
+        } else if self.history_index > 0 {
+            // Go back one more step
+            self.history_index -= 1;
+        }
+        
+        // Restore the historical state
+        if self.history_index >= 0 && (self.history_index as usize) < self.history.len() {
+            self.text_buffer = self.history[self.history_index as usize].clone();
+        }
+        
+        // Clear any active selection
+        self.is_selecting = false;
+        
+        Ok(())
+    }
+    
+    fn redo(&mut self) -> Result<()> {
+        if self.history.is_empty() {
+            return Ok(());
+        }
+        
+        // Can only redo if we're in historical position (not at latest)
+        if self.history_index >= 0 {
+            let next_index = self.history_index + 1;
+            if (next_index as usize) < self.history.len() {
+                self.history_index = next_index;
+                self.text_buffer = self.history[self.history_index as usize].clone();
+            } else {
+                // Go back to latest (current) state
+                self.history_index = -1;
+                // Latest state should be the last item in history
+                if let Some(latest) = self.history.last() {
+                    self.text_buffer = latest.clone();
+                }
+            }
+        }
+        
+        // Clear any active selection
+        self.is_selecting = false;
         
         Ok(())
     }
