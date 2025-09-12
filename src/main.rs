@@ -182,35 +182,14 @@ impl WysiwygEditor {
     }
     
     fn rebuild_spatial_layout(&mut self) {
-        // Calculate page bounds for proper scaling
-        let min_hpos = self.elements.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
-        let max_hpos = self.elements.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
-        let min_vpos = self.elements.iter().map(|e| e.vpos).fold(f32::INFINITY, f32::min);
-        let max_vpos = self.elements.iter().map(|e| e.vpos + e._height).fold(f32::NEG_INFINITY, f32::max);
-        
-        let page_width = max_hpos - min_hpos;
-        let page_height = max_vpos - min_vpos;
+        let (min_hpos, _max_hpos, min_vpos, _max_vpos, page_width, page_height) = self.calculate_page_bounds();
         
         // Create spatial grid for terminal display
         let terminal_width = 120; // Wider for better table handling
         let terminal_height = 60;
         
-        // Create 2D grid to place elements
-        let mut grid: Vec<Vec<String>> = vec![vec![" ".to_string(); terminal_width]; terminal_height];
+        let mut grid = vec![vec![' '; terminal_width]; terminal_height]; // Use chars for efficiency
         
-        // Debug: Log how many elements we have and their types
-        let total_elements = self.elements.len();
-        let space_elements = self.elements.iter().filter(|e| e.content == " ").count();
-        let text_elements = self.elements.iter().filter(|e| e.content != " ").count();
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/chonker95_debug.log")
-            .and_then(|mut file| {
-                use std::io::Write;
-                writeln!(file, "LAYOUT: Total elements: {}, Space elements: {}, Text elements: {}", 
-                    total_elements, space_elements, text_elements)
-            });
 
         // Map each element to terminal grid using precise coordinates (RESTORE HIGH WATERMARK)
         for element in &self.elements {
@@ -238,9 +217,9 @@ impl WysiwygEditor {
                 0.0
             };
             
-            // Smart quantization - cluster nearby coordinates
-            let x = self.quantize_coordinate(raw_x, 2.0) as usize; // 2-char clustering
-            let y = self.quantize_coordinate(raw_y, 1.0) as usize; // 1-line clustering
+            // Smart quantization - cluster nearby coordinates (inlined)
+            let x = ((raw_x / 2.0).round() * 2.0) as usize; // 2-char clustering
+            let y = ((raw_y / 1.0).round() * 1.0) as usize; // 1-line clustering
             
             // Place text in grid, handling overlaps
             let content = if element.content == " " {
@@ -249,21 +228,22 @@ impl WysiwygEditor {
                 element.content.trim()
             };
             
-            if y < terminal_height && x < terminal_width && !content.is_empty() {
+            if y < terminal_height && x < terminal_width && !content.is_empty() && y < grid.len() && x < grid[0].len() {
                 // For space elements, just place a single space
                 if element.content == " " {
-                    if grid[y][x] == " " { // Only place space if position is empty
-                        grid[y][x] = " ".to_string();
+                    if grid[y][x] == ' ' { // Only place space if position is empty
+                        grid[y][x] = ' ';
                     }
                 } else {
                     // For text elements, place character by character
-                    let chars: Vec<char> = content.chars().collect();
-                    for (i, ch) in chars.iter().enumerate() {
+                    for (i, ch) in content.char_indices() {
                         let pos_x = x + i;
                         if pos_x < terminal_width {
-                            // Only overwrite spaces or if this element has higher priority
-                            if grid[y][pos_x] == " " || self.has_higher_priority(element, &grid[y][pos_x]) {
-                                grid[y][pos_x] = ch.to_string();
+                            // Only overwrite spaces or if element has priority (inlined)
+                            let has_priority = grid[y][pos_x] == ' ' || 
+                                element.content.chars().any(|c| c.is_numeric() || c == '$' || c == '%');
+                            if has_priority {
+                                grid[y][pos_x] = ch;
                             }
                         }
                     }
@@ -271,30 +251,26 @@ impl WysiwygEditor {
             }
         }
         
-        // Convert grid back to text buffer
-        self.text_buffer = String::new();
-        for row in &grid {
-            let line: String = row.iter()
-                .map(|cell| cell.as_str())
-                .collect::<Vec<_>>()
-                .join("")
-                .trim_end()
-                .to_string();
-            
-            if !line.trim().is_empty() || !self.text_buffer.is_empty() {
-                self.text_buffer.push_str(&line);
-                self.text_buffer.push('\n');
-            }
-        }
+        // Convert grid to text efficiently
+        let buffer_lines: Vec<String> = grid.iter()
+            .map(|row| row.iter().collect::<String>().trim_end().to_string())
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        self.text_buffer = buffer_lines.join("\n");
     }
     
-    fn rebuild_sequential_layout(&mut self) {
-        // Group elements by line and process sequentially for good text flow
+    fn calculate_page_bounds(&self) -> (f32, f32, f32, f32, f32, f32) {
         let min_hpos = self.elements.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
         let max_hpos = self.elements.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
         let min_vpos = self.elements.iter().map(|e| e.vpos).fold(f32::INFINITY, f32::min);
-        
+        let max_vpos = self.elements.iter().map(|e| e.vpos + e._height).fold(f32::NEG_INFINITY, f32::max);
         let page_width = max_hpos - min_hpos;
+        let page_height = max_vpos - min_vpos;
+        (min_hpos, max_hpos, min_vpos, max_vpos, page_width, page_height)
+    }
+    
+    fn rebuild_sequential_layout(&mut self) {
+        let (min_hpos, _max_hpos, min_vpos, _max_vpos, page_width, _page_height) = self.calculate_page_bounds();
         let page_center = min_hpos + (page_width / 2.0);
         
         // Group elements by line with better clustering
@@ -389,42 +365,8 @@ impl WysiwygEditor {
         Ok(())
     }
     
-    fn has_higher_priority(&self, element: &AltoElement, existing: &str) -> bool {
-        // Prefer actual content over spaces, numbers over letters for tables
-        if existing == " " {
-            return true;
-        }
-        
-        let content = &element.content;
-        // Numbers and money values have higher priority for table alignment
-        content.chars().any(|c| c.is_numeric() || c == '$' || c == '%')
-    }
     
-    fn quantize_coordinate(&self, raw_coord: f32, cluster_size: f32) -> f32 {
-        // Cluster nearby coordinates to same terminal position
-        (raw_coord / cluster_size).round() * cluster_size
-    }
     
-    fn is_line_centered(&self, line: &[AltoElement], page_center: f32, page_width: f32) -> bool {
-        if line.is_empty() {
-            return false;
-        }
-        
-        // Calculate the center of this line's text
-        let line_start = line.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
-        let line_end = line.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
-        let line_center = line_start + ((line_end - line_start) / 2.0);
-        
-        // Consider it centered if within 15% of page center
-        let tolerance = page_width * 0.15;
-        let distance_from_center = (line_center - page_center).abs();
-        
-        // Also check if line is significantly shorter than full width (typical for centered content)
-        let line_width = line_end - line_start;
-        let is_short_line = line_width < (page_width * 0.7);
-        
-        distance_from_center < tolerance && is_short_line
-    }
     
     fn extract_alto_elements(&self) -> Result<Vec<AltoElement>> {
         let output = std::process::Command::new("pdfalto")
@@ -600,8 +542,7 @@ impl WysiwygEditor {
     
     fn render_text_only(&self) -> Result<()> {
         // Display the text buffer as continuous text (full width)
-        let lines: Vec<&str> = self.text_buffer.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
+        for (i, line) in self.text_buffer.lines().enumerate() {
             if i < (self.terminal_height - 2) as usize {
                 execute!(io::stdout(), cursor::MoveTo(0, i as u16))?;
                 self.render_line_with_selection(line, i as u16, 0)?;
@@ -713,31 +654,40 @@ impl WysiwygEditor {
             let line_chars: Vec<char> = line.chars().collect();
             let selection_width = (norm_end_x - norm_start_x + 1) as usize;
             
-            // Render up to selection start normally
+            // Build the entire line in memory to reduce flicker
+            let mut rendered_line = String::new();
+            
+            // Add pre-selection content
             for i in 0..norm_start_x as usize {
                 if i < line_chars.len() {
-                    execute!(io::stdout(), Print(line_chars[i]))?;
+                    rendered_line.push(line_chars[i]);
                 } else {
-                    execute!(io::stdout(), Print(' '))?;
+                    rendered_line.push(' ');
                 }
             }
             
-            // Render selection area with blue background
-            execute!(io::stdout(), SetBackgroundColor(Color::Blue), SetForegroundColor(Color::White))?;
+            
+            // Add selection content (will be styled separately)
+            let mut selection_content = String::new();
             for i in 0..selection_width {
                 let char_index = norm_start_x as usize + i;
                 if char_index < line_chars.len() {
-                    execute!(io::stdout(), Print(line_chars[char_index]))?;
+                    selection_content.push(line_chars[char_index]);
                 } else {
-                    execute!(io::stdout(), Print(' '))?; // Fill empty spaces with blue
+                    selection_content.push(' ');
                 }
             }
-            execute!(io::stdout(), ResetColor)?;
             
-            // Render remainder of line normally
+            // Add post-selection content
+            let mut post_selection = String::new();
             for i in (norm_end_x + 1) as usize..line_chars.len() {
-                execute!(io::stdout(), Print(line_chars[i]))?;
+                post_selection.push(line_chars[i]);
             }
+            
+            // Render in one go to reduce flicker
+            execute!(io::stdout(), Print(&rendered_line))?;
+            execute!(io::stdout(), SetBackgroundColor(Color::Blue), SetForegroundColor(Color::White), Print(&selection_content), ResetColor)?;
+            execute!(io::stdout(), Print(&post_selection))?;
         } else {
             // Row is not in selection - normal rendering
             execute!(io::stdout(), Print(line))?;
@@ -992,15 +942,15 @@ impl WysiwygEditor {
             self.selection_end_y = y;
             
             // Position cursor at the bottom-right corner of selection
-            let (min_x, max_x) = if self.selection_start_x <= self.selection_end_x {
-                (self.selection_start_x, self.selection_end_x)
+            let max_x = if self.selection_start_x <= self.selection_end_x {
+                self.selection_end_x
             } else {
-                (self.selection_end_x, self.selection_start_x)
+                self.selection_start_x
             };
-            let (min_y, max_y) = if self.selection_start_y <= self.selection_end_y {
-                (self.selection_start_y, self.selection_end_y)
+            let max_y = if self.selection_start_y <= self.selection_end_y {
+                self.selection_end_y
             } else {
-                (self.selection_end_y, self.selection_start_y)
+                self.selection_start_y
             };
             
             self.cursor_x = max_x;
@@ -1109,6 +1059,7 @@ impl WysiwygEditor {
             // Global controls (always available)
             KeyCode::Char('a') | KeyCode::Char('A') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.ab_mode = !self.ab_mode;
+                self.is_selecting = false; // Clear selection when switching modes
                 if self.ab_mode {
                     self.pdf_image_rendered = false; // Force re-render for A-B mode
                     self.active_pane = ActivePane::Image; // Start with image focused in A-B mode
@@ -1269,7 +1220,8 @@ impl WysiwygEditor {
         let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
         
         // Ensure we have enough lines for cursor position
-        while lines.len() <= self.cursor_y as usize {
+        let target_size = (self.cursor_y as usize + 1).min(500);
+        while lines.len() < target_size {
             lines.push(String::new());
         }
         
@@ -1340,15 +1292,15 @@ impl WysiwygEditor {
     fn update_cursor_to_selection_corner(&mut self) {
         if self.is_selecting {
             // Position cursor at the bottom-right corner of selection
-            let (min_x, max_x) = if self.selection_start_x <= self.selection_end_x {
-                (self.selection_start_x, self.selection_end_x)
+            let max_x = if self.selection_start_x <= self.selection_end_x {
+                self.selection_end_x
             } else {
-                (self.selection_end_x, self.selection_start_x)
+                self.selection_start_x
             };
-            let (min_y, max_y) = if self.selection_start_y <= self.selection_end_y {
-                (self.selection_start_y, self.selection_end_y)
+            let max_y = if self.selection_start_y <= self.selection_end_y {
+                self.selection_end_y
             } else {
-                (self.selection_end_y, self.selection_start_y)
+                self.selection_start_y
             };
             
             self.cursor_x = max_x;
@@ -1362,7 +1314,6 @@ impl WysiwygEditor {
         }
         
         let lines: Vec<&str> = self.text_buffer.lines().collect();
-        let mut clipboard_text = String::new();
         
         // Normalize selection bounds
         let (start_y, end_y) = if self.selection_start_y <= self.selection_end_y {
@@ -1399,7 +1350,7 @@ impl WysiwygEditor {
             }
         }
         
-        clipboard_text = clipboard_lines.join("\n");
+        let clipboard_text = clipboard_lines.join("\n");
         
         // Copy to both internal and system clipboard
         self.clipboard = clipboard_lines;
@@ -1496,7 +1447,8 @@ impl WysiwygEditor {
         let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
         
         // Ensure we have enough lines for the paste operation
-        while lines.len() <= (self.cursor_y as usize + clipboard_lines.len()) {
+        let target_size = (self.cursor_y as usize + clipboard_lines.len() + 1).min(500);
+        while lines.len() < target_size {
             lines.push(String::new());
         }
         
@@ -1763,47 +1715,6 @@ impl WysiwygEditor {
     }
     
     
-    fn get_selected_text(&self) -> String {
-        let lines: Vec<&str> = self.text_buffer.lines().collect();
-        let mut selected_text = String::new();
-        
-        // Normalize selection bounds
-        let (start_y, end_y) = if self.selection_start_y <= self.selection_end_y {
-            (self.selection_start_y, self.selection_end_y)
-        } else {
-            (self.selection_end_y, self.selection_start_y)
-        };
-        
-        let (start_x, end_x) = if self.selection_start_x <= self.selection_end_x {
-            (self.selection_start_x, self.selection_end_x)
-        } else {
-            (self.selection_end_x, self.selection_start_x)
-        };
-        
-        // Extract selected block maintaining spatial relationships
-        for y in start_y..=end_y {
-            if (y as usize) < lines.len() {
-                let line = lines[y as usize];
-                let line_chars: Vec<char> = line.chars().collect();
-                
-                let mut row_text = String::new();
-                for x in start_x..=end_x {
-                    if (x as usize) < line_chars.len() {
-                        row_text.push(line_chars[x as usize]);
-                    } else {
-                        row_text.push(' ');
-                    }
-                }
-                
-                if !row_text.trim().is_empty() {
-                    selected_text.push_str(&row_text.trim_end());
-                    selected_text.push('\n');
-                }
-            }
-        }
-        
-        selected_text
-    }
     
     
     fn save_to_history(&mut self) {
