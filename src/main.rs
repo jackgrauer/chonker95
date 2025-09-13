@@ -29,6 +29,23 @@ enum ActivePane {
     Text,   // Right pane - text editing
 }
 
+#[derive(Debug, Clone)]
+enum EditorMode {
+    Text { 
+        scroll_offset: usize 
+    },
+    SplitScreen { 
+        active_pane: ActivePane,
+        pan_offset: (i16, i16),
+        image_rendered: bool,
+    },
+    FilePicker {
+        path: PathBuf,
+        files: Vec<PathBuf>,
+        selected: usize,
+    },
+}
+
 // Only Flow mode - spatial will be applied to selected blocks
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LayoutMode {
@@ -207,6 +224,143 @@ impl Selection {
     
     fn clear(&mut self) {
         self.active = false;
+    }
+}
+
+struct PdfRenderer {
+    pdf_path: PathBuf,
+    current_page: u32,
+    zoom_level: u16,
+    dark_mode: bool,
+}
+
+impl PdfRenderer {
+    fn new(pdf_path: PathBuf, page: u32, zoom: u16, dark: bool) -> Self {
+        Self {
+            pdf_path,
+            current_page: page,
+            zoom_level: zoom,
+            dark_mode: dark,
+        }
+    }
+    
+    fn render_to_kitty(&self, pan_offset: (i16, i16), terminal_dims: (u16, u16)) -> Result<()> {
+        let temp_file = self.generate_temp_filename(".ppm");
+        let final_file = if self.dark_mode {
+            self.generate_temp_filename(".png")
+        } else {
+            temp_file.clone()
+        };
+        
+        // Clean up existing files
+        let _ = std::fs::remove_file(&final_file);
+        if self.dark_mode {
+            let _ = std::fs::remove_file(&temp_file);
+        }
+        
+        // Render PDF to temporary file
+        self.render_pdf_to_file(&temp_file)?;
+        
+        // Process for dark mode if needed
+        if self.dark_mode {
+            self.apply_dark_mode(&temp_file, &final_file)?;
+            let _ = std::fs::remove_file(&temp_file);
+        }
+        
+        // Display in kitty with positioning
+        self.display_in_kitty(&final_file, pan_offset, terminal_dims)?;
+        
+        Ok(())
+    }
+    
+    fn generate_temp_filename(&self, extension: &str) -> String {
+        format!("/tmp/chonker_p{}_{}{}", self.current_page, self.zoom_level, extension)
+    }
+    
+    fn render_pdf_to_file(&self, output_path: &str) -> Result<()> {
+        let target_dpi = (self.zoom_level as f32 * 0.7) as u16;
+        let result = std::process::Command::new("gs")
+            .args([
+                "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dNOSAFER",
+                "-sDEVICE=ppmraw",
+                &format!("-dFirstPage={}", self.current_page),
+                &format!("-dLastPage={}", self.current_page),
+                &format!("-r{}", target_dpi),
+                &format!("-sOutputFile={}", output_path),
+            ])
+            .arg(&self.pdf_path)
+            .output()?;
+            
+        if !result.status.success() {
+            return Err(anyhow::anyhow!("Ghostscript failed"));
+        }
+        
+        Ok(())
+    }
+    
+    fn apply_dark_mode(&self, input_path: &str, output_path: &str) -> Result<()> {
+        let result = std::process::Command::new("convert")
+            .args([
+                input_path,
+                "-negate",
+                "-strip", 
+                "-format", "png",
+                output_path,
+            ])
+            .output();
+            
+        match result {
+            Ok(output) if output.status.success() => Ok(()),
+            _ => {
+                // Fallback: copy original if ImageMagick fails
+                std::fs::copy(input_path, output_path)?;
+                Ok(())
+            }
+        }
+    }
+    
+    fn display_in_kitty(&self, image_path: &str, pan_offset: (i16, i16), terminal_dims: (u16, u16)) -> Result<()> {
+        if !Self::is_kitty_terminal() {
+            return self.fallback_display(image_path);
+        }
+        
+        if !std::path::Path::new(image_path).exists() {
+            return Err(anyhow::anyhow!("Image file not found: {}", image_path));
+        }
+        
+        let split_x = terminal_dims.0 / 2;
+        let base_cols = (split_x - 1).max(10);
+        let base_rows = (terminal_dims.1 - 2).max(10);
+        
+        let zoom_factor = self.zoom_level as f32 / 100.0;
+        let cols = ((base_cols as f32 * zoom_factor) as u16).max(10);
+        let rows = ((base_rows as f32 * zoom_factor) as u16).max(10);
+        
+        let display_x = (1 + pan_offset.0).max(1) as u16;
+        let display_y = (1 + pan_offset.1).max(1) as u16;
+        
+        let _ = std::process::Command::new("kitty")
+            .args(["+kitten", "icat", 
+                   &format!("--place={}x{}@{}x{}", cols - 2, rows - 2, display_x, display_y),
+                   "--scale-up",
+                   "--transfer-mode=file",
+                   image_path])
+            .status();
+        
+        Ok(())
+    }
+    
+    fn is_kitty_terminal() -> bool {
+        std::env::var("KITTY_WINDOW_ID").is_ok() ||
+        std::env::var("TERM_PROGRAM").unwrap_or_default() == "kitty" ||
+        std::env::var("TERM").unwrap_or_default().contains("kitty")
+    }
+    
+    fn fallback_display(&self, image_path: &str) -> Result<()> {
+        std::process::Command::new("open")
+            .args(["-a", "Preview", image_path])
+            .spawn()?;
+        Ok(())
     }
 }
 
@@ -539,27 +693,16 @@ struct WysiwygEditor {
     text_buffer: String,
     cursor_x: u16,
     cursor_y: u16,
-    // A-B comparison mode
-    ab_mode: bool,
-    pdf_image_rendered: bool,
+    // Editor mode (replaces ab_mode, file_picker_open, etc.)
+    mode: EditorMode,
     // Dark mode for PDF display
     dark_mode: bool,
     // Block text selection
     selection: Selection,
     // Clipboard for copy/paste
     clipboard: Vec<String>,
-    // File picker
-    file_picker_open: bool,
-    file_list: Vec<PathBuf>,
-    file_picker_selected: usize,
-    file_picker_path: PathBuf,
     // Zoom controls
     zoom_level: u16, // Resolution multiplier (100, 150, 200, 300, etc.)
-    // Pane focus (for A-B mode)
-    active_pane: ActivePane,
-    // Image viewport panning
-    pan_offset_x: i16,
-    pan_offset_y: i16,
     // Undo/redo system
     history: Vec<String>,
     history_index: isize, // -1 means at latest, 0+ means historical position
@@ -568,8 +711,6 @@ struct WysiwygEditor {
     // Performance: dirty tracking
     text_buffer_dirty: bool,
     last_layout_mode: LayoutMode,
-    // Scroll offset for text mode
-    scroll_offset: usize,
     // Total pages in PDF
     total_pages: u32,
 }
@@ -577,7 +718,6 @@ struct WysiwygEditor {
 impl WysiwygEditor {
     fn new(pdf_path: PathBuf, page: u32) -> Result<Self> {
         let (width, height) = terminal::size()?;
-        let file_picker_path = pdf_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
         let mut editor = Self {
             elements: Vec::new(),
             pdf_path,
@@ -587,25 +727,16 @@ impl WysiwygEditor {
             text_buffer: String::new(),
             cursor_x: 0,
             cursor_y: 0,
-            ab_mode: false,
-            pdf_image_rendered: false,
+            mode: EditorMode::Text { scroll_offset: 0 },
             dark_mode: true, // Default to dark mode
             selection: Selection::new(),
             clipboard: Vec::new(),
-            file_picker_open: false,
-            file_list: Vec::new(),
-            file_picker_selected: 0,
-            file_picker_path,
             zoom_level: 100, // Start at 100 DPI
-            active_pane: ActivePane::Text, // Start with text editing focused
-            pan_offset_x: 0,
-            pan_offset_y: 0,
             history: Vec::new(),
             history_index: -1,
             layout_mode: LayoutMode::Flow, // Start with natural text flow
             text_buffer_dirty: true, // Needs initial build
             last_layout_mode: LayoutMode::Flow,
-            scroll_offset: 0,
             total_pages: 1, // Will be updated after loading
         };
         
@@ -620,7 +751,9 @@ impl WysiwygEditor {
         self.update_total_pages()?;
         self.elements = self.extract_alto_elements()?;
         self.text_buffer_dirty = true; // New elements require rebuild
-        self.scroll_offset = 0; // Reset scroll when loading new page
+        if let EditorMode::Text { scroll_offset } = &mut self.mode {
+            *scroll_offset = 0; // Reset scroll when loading new page
+        }
         self.rebuild_text_buffer();
         Ok(())
     }
@@ -700,7 +833,14 @@ impl WysiwygEditor {
     
     
     fn handle_image_pane_input(&mut self, key: KeyCode) -> Result<bool> {
-        if !self.ab_mode || self.active_pane != ActivePane::Image {
+        let (active_pane, pan_offset, image_rendered) = match &mut self.mode {
+            EditorMode::SplitScreen { active_pane, pan_offset, image_rendered } => {
+                (active_pane, pan_offset, image_rendered)
+            }
+            _ => return Ok(false),
+        };
+        
+        if *active_pane != ActivePane::Image {
             return Ok(false);
         }
         
@@ -718,26 +858,26 @@ impl WysiwygEditor {
                 Ok(true)
             }
             KeyCode::Up => {
-                self.pan_offset_y -= 5;
-                self.pdf_image_rendered = false;
+                pan_offset.1 -= 5;
+                *image_rendered = false;
                 self.render_pdf_image()?;
                 Ok(true)
             }
             KeyCode::Down => {
-                self.pan_offset_y += 5;
-                self.pdf_image_rendered = false;
+                pan_offset.1 += 5;
+                *image_rendered = false;
                 self.render_pdf_image()?;
                 Ok(true)
             }
             KeyCode::Left => {
-                self.pan_offset_x -= 5;
-                self.pdf_image_rendered = false;
+                pan_offset.0 -= 5;
+                *image_rendered = false;
                 self.render_pdf_image()?;
                 Ok(true)
             }
             KeyCode::Right => {
-                self.pan_offset_x += 5;
-                self.pdf_image_rendered = false;
+                pan_offset.0 += 5;
+                *image_rendered = false;
                 self.render_pdf_image()?;
                 Ok(true)
             }
@@ -814,46 +954,43 @@ impl WysiwygEditor {
     }
     
     fn render(&self) -> Result<()> {
-        // If file picker is open, render it instead of normal content
-        if self.file_picker_open {
-            self.render_file_picker()?;
-            return Ok(());
-        }
-        
-        // Minimal clearing to reduce flashing
-        if !self.ab_mode {
-            TerminalRenderer::new().clear_screen().render();
-        }
-        // In A-B mode, don't clear at all - just update what's needed
-        
-        if self.ab_mode {
-            self.render_split_screen()?;
-        } else {
-            self.render_text_only()?;
+        match &self.mode {
+            EditorMode::Text { scroll_offset } => {
+                TerminalRenderer::new().clear_screen().render();
+                self.render_text_only(*scroll_offset)?;
+            }
+            EditorMode::SplitScreen { .. } => {
+                // In split screen mode, don't clear - just update what's needed
+                self.render_split_screen()?;
+            }
+            EditorMode::FilePicker { .. } => {
+                self.render_file_picker()?;
+                return Ok(()); // Skip status line for file picker
+            }
         }
         
         // Status line - always FLOW mode now
         let mode_indicator = "FLOW";
         
-        let pane_indicator = if self.ab_mode {
-            match self.active_pane {
-                ActivePane::Image => " - [IMAGE]",
-                ActivePane::Text => " - [TEXT]",
+        let (pane_indicator, scroll_info) = match &self.mode {
+            EditorMode::Text { scroll_offset } => {
+                let total_lines = self.text_buffer.lines().count();
+                let visible_lines = (self.terminal_height - 1) as usize;
+                let scroll_info = if total_lines > visible_lines {
+                    format!(" - Line {}/{}", scroll_offset + 1, total_lines)
+                } else {
+                    String::new()
+                };
+                ("", scroll_info)
             }
-        } else {
-            ""
-        };
-        
-        let scroll_info = if !self.ab_mode {
-            let total_lines = self.text_buffer.lines().count();
-            let visible_lines = (self.terminal_height - 1) as usize;
-            if total_lines > visible_lines {
-                format!(" - Line {}/{}", self.scroll_offset + 1, total_lines)
-            } else {
-                String::new()
+            EditorMode::SplitScreen { active_pane, .. } => {
+                let pane_info = match active_pane {
+                    ActivePane::Image => " - [IMAGE]",
+                    ActivePane::Text => " - [TEXT]",
+                };
+                (pane_info, String::new())
             }
-        } else {
-            String::new()
+            EditorMode::FilePicker { .. } => ("", String::new()),
         };
         
         let status_text = format!("{} - Page {}/{} - {}% - {}{}{}", 
@@ -869,20 +1006,26 @@ impl WysiwygEditor {
         let mut renderer = TerminalRenderer::new()
             .draw_status_line(self.terminal_height - 1, &status_text);
         
-        // Position cursor only in text mode
-        if !self.ab_mode {
-            renderer = renderer
-                .move_cursor(self.cursor_x, self.cursor_y)
-                .show_cursor();
-        } else {
-            renderer = renderer.hide_cursor();
+        // Position cursor based on mode
+        match &self.mode {
+            EditorMode::Text { .. } => {
+                renderer = renderer
+                    .move_cursor(self.cursor_x, self.cursor_y)
+                    .show_cursor();
+            }
+            EditorMode::SplitScreen { .. } => {
+                renderer = renderer.hide_cursor();
+            }
+            EditorMode::FilePicker { .. } => {
+                // File picker handles its own cursor
+            }
         }
         
         renderer.render();
         Ok(())
     }
     
-    fn render_text_only(&self) -> Result<()> {
+    fn render_text_only(&self, scroll_offset: usize) -> Result<()> {
         // Calculate how many lines we can show (leave room for status line)
         let available_lines = (self.terminal_height - 1) as usize;
         let total_lines: Vec<&str> = self.text_buffer.lines().collect();
@@ -892,7 +1035,7 @@ impl WysiwygEditor {
             .clear_area(0, 0, self.terminal_width as usize, available_lines);
         
         // Render visible lines starting from scroll_offset
-        for (screen_line, text_line_index) in (self.scroll_offset..).enumerate() {
+        for (screen_line, text_line_index) in (scroll_offset..).enumerate() {
             if screen_line >= available_lines {
                 break;
             }
@@ -1005,181 +1148,33 @@ impl WysiwygEditor {
     }
     
     fn render_pdf_image(&mut self) -> Result<()> {
-        if !self.ab_mode || self.pdf_image_rendered {
-            return Ok(());
-        }
-        
-        // Ultra-fast file operations - PPM for speed
-        let output_file = format!("/tmp/chonker_kitty_{}.ppm", self.current_page);
-        let use_temp = self.dark_mode;
-        
-        let (temp_file, final_file) = if use_temp {
-            (format!("/tmp/chonker_temp_{}.ppm", self.current_page), 
-             format!("/tmp/chonker_kitty_{}.png", self.current_page)) // Convert to PNG for dark mode
-        } else {
-            (output_file.clone(), output_file.clone())
+        let (pan_offset, image_rendered) = match &mut self.mode {
+            EditorMode::SplitScreen { pan_offset, image_rendered, .. } => {
+                (pan_offset, image_rendered)
+            }
+            _ => return Ok(()),
         };
         
-        // Clean up only what we need
-        let _ = std::fs::remove_file(&final_file);
-        if use_temp { let _ = std::fs::remove_file(&temp_file); }
-        
-        // Log to file instead of terminal
-        let _ = std::fs::write("/tmp/chonker95_debug.log", 
-            format!("Rendering PDF at {}% zoom ({}dpi) for page {}\n", self.zoom_level, self.zoom_level + 50, self.current_page));
-        
-        // Minimal ghostscript for maximum speed
-        let target_dpi = (self.zoom_level as f32 * 0.7) as u16;
-        let result = std::process::Command::new("gs")
-            .args([
-                "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dNOSAFER",
-                "-sDEVICE=ppmraw", // Raw PPM is fastest to generate
-                &format!("-dFirstPage={}", self.current_page),
-                &format!("-dLastPage={}", self.current_page),
-                &format!("-r{}", target_dpi),
-                &format!("-sOutputFile={}", temp_file),
-            ])
-            .arg(&self.pdf_path)
-            .output()?;
-            
-        if !result.status.success() {
+        if *image_rendered {
             return Ok(());
         }
         
-        if std::path::Path::new(&temp_file).exists() {
-            // Process dark mode only if needed (saves 50% operations for light mode)
-            if use_temp && self.dark_mode {
-                self.process_dark_mode_image(&temp_file, &final_file)?;
-                let _ = std::fs::remove_file(&temp_file); // Cleanup temp immediately
-            }
-            
-            self.display_image_in_kitty(&final_file)?;
-            self.pdf_image_rendered = true;
-        }
+        let renderer = PdfRenderer::new(
+            self.pdf_path.clone(),
+            self.current_page,
+            self.zoom_level,
+            self.dark_mode,
+        );
         
+        renderer.render_to_kitty(
+            *pan_offset,
+            (self.terminal_width, self.terminal_height),
+        )?;
+        
+        *image_rendered = true;
         Ok(())
     }
     
-    fn process_dark_mode_image(&self, input_path: &str, output_path: &str) -> Result<()> {
-        
-        // Convert PPM to PNG with dark mode processing
-        let result = std::process::Command::new("convert")
-            .args([
-                input_path,
-                "-negate", // Invert colors
-                "-strip", // Remove metadata
-                "-format", "png", // Ensure PNG output
-                output_path,
-            ])
-            .output();
-            
-        match result {
-            Ok(output) => {
-                if !output.status.success() {
-                    // Fallback: just copy the original file
-                    std::fs::copy(input_path, output_path)?;
-                }
-            }
-            Err(_) => {
-                // ImageMagick not available, use original image
-                std::fs::copy(input_path, output_path)?;
-            }
-        }
-        
-        Ok(())
-    }
-    
-    fn display_image_in_kitty(&self, image_path: &str) -> Result<()> {
-        // Check if we're actually in kitty terminal
-        if !self.is_kitty_terminal() {
-            return self.fallback_image_display(image_path);
-        }
-        
-        // Check if the image file exists
-        if !std::path::Path::new(image_path).exists() {
-            eprintln!("Image file not found: {}", image_path);
-            return Ok(());
-        }
-        
-        let split_x = self.terminal_width / 2;
-        let base_cols = (split_x - 1).max(10);
-        let base_rows = (self.terminal_height - 2).max(10);
-        
-        // Scale dimensions based on zoom level
-        let zoom_factor = self.zoom_level as f32 / 100.0;
-        let cols = ((base_cols as f32 * zoom_factor) as u16).max(10);
-        let rows = ((base_rows as f32 * zoom_factor) as u16).max(10);
-        
-        // Center the image in the left panel with minimal margins for maximum size
-        let margin_x = 1; // Minimal left margin
-        let margin_y = 0; // No top margin for maximum height
-        
-        // Apply pan offsets to image position (fast movement)
-        let display_x = (margin_x as i16 + 1 + self.pan_offset_x).max(1) as u16;
-        let display_y = (margin_y as i16 + 1 + self.pan_offset_y).max(1) as u16;
-        
-        // Ultra-fast image display without clearing (eliminates flash)
-        let _ = std::process::Command::new("kitty")
-            .args(["+kitten", "icat", 
-                   &format!("--place={}x{}@{}x{}", cols - (margin_x * 2), rows - (margin_y * 2), display_x, display_y),
-                   "--scale-up",
-                   "--transfer-mode=file", // Faster file transfer
-                   image_path])
-            .status();
-        
-        Ok(())
-    }
-    
-    fn is_kitty_terminal(&self) -> bool {
-        // Check multiple environment variables for Kitty detection
-        // KITTY_WINDOW_ID is the most reliable indicator
-        if std::env::var("KITTY_WINDOW_ID").is_ok() {
-            return true;
-        }
-        
-        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-        let term = std::env::var("TERM").unwrap_or_default();
-        
-        term_program == "kitty" || term.contains("kitty") || term == "xterm-kitty"
-    }
-    
-    fn fallback_image_display(&self, image_path: &str) -> Result<()> {
-        // Fallback for non-kitty terminals
-        let result = std::process::Command::new("open")
-            .args(["-a", "Preview", image_path])
-            .spawn();
-            
-        match result {
-            Ok(_) => {
-                execute!(
-                    io::stdout(),
-                    cursor::MoveTo(2, 2),
-                    SetForegroundColor(Color::Yellow),
-                    Print("PDF opened in external viewer"),
-                    ResetColor,
-                    cursor::MoveTo(2, 3),
-                    SetForegroundColor(Color::Yellow),
-                    Print("(Terminal doesn't support kitty graphics)"),
-                    ResetColor
-                )?;
-            }
-            Err(_) => {
-                execute!(
-                    io::stdout(),
-                    cursor::MoveTo(2, 2),
-                    SetForegroundColor(Color::Red),
-                    Print("No image display available"),
-                    ResetColor,
-                    cursor::MoveTo(2, 3),
-                    SetForegroundColor(Color::Yellow),
-                    Print(format!("File: {}", image_path)),
-                    ResetColor
-                )?;
-            }
-        }
-        
-        Ok(())
-    }
     
     fn handle_mouse_click(&mut self, x: u16, y: u16) -> Result<()> {
         // Allow cursor to go anywhere, even beyond viewport
@@ -1240,22 +1235,31 @@ impl WysiwygEditor {
             
             // Mode operations
             (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                self.ab_mode = !self.ab_mode;
                 self.selection.clear();
-                if self.ab_mode {
-                    self.pdf_image_rendered = false;
-                    self.active_pane = ActivePane::Image;
-                } else {
-                    execute!(io::stdout(), Clear(ClearType::All))?;
-                    self.active_pane = ActivePane::Text;
+                match &self.mode {
+                    EditorMode::Text { .. } => {
+                        self.mode = EditorMode::SplitScreen {
+                            active_pane: ActivePane::Image,
+                            pan_offset: (0, 0),
+                            image_rendered: false,
+                        };
+                    }
+                    EditorMode::SplitScreen { .. } => {
+                        execute!(io::stdout(), Clear(ClearType::All))?;
+                        self.mode = EditorMode::Text { scroll_offset: 0 };
+                    }
+                    EditorMode::FilePicker { .. } => {
+                        // Switch from file picker to text mode
+                        self.mode = EditorMode::Text { scroll_offset: 0 };
+                    }
                 }
                 return Ok(false);
             }
             
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.dark_mode = !self.dark_mode;
-                if self.ab_mode {
-                    self.pdf_image_rendered = false;
+                if let EditorMode::SplitScreen { image_rendered, .. } = &mut self.mode {
+                    *image_rendered = false;
                 }
                 return Ok(false);
             }
@@ -1266,8 +1270,8 @@ impl WysiwygEditor {
                 if self.current_page > 1 {
                     self.current_page -= 1;
                     self.load_page()?;
-                    if self.ab_mode {
-                        self.pdf_image_rendered = false;
+                    if let EditorMode::SplitScreen { image_rendered, .. } = &mut self.mode {
+                        *image_rendered = false;
                     }
                     eprintln!("SUCCESS: Changed to page {}", self.current_page);
                 }
@@ -1279,8 +1283,8 @@ impl WysiwygEditor {
                 if self.current_page < self.total_pages {
                     self.current_page += 1;
                     self.load_page()?;
-                    if self.ab_mode {
-                        self.pdf_image_rendered = false;
+                    if let EditorMode::SplitScreen { image_rendered, .. } = &mut self.mode {
+                        *image_rendered = false;
                     }
                     eprintln!("SUCCESS: Changed to page {}", self.current_page);
                 }
@@ -1451,8 +1455,9 @@ impl WysiwygEditor {
     }
     
     fn insert_char_at_cursor(&mut self, c: char) -> Result<()> {
-        self.with_history(|editor| {
-            let mut lines: Vec<String> = editor.text_buffer.lines().map(|s| s.to_string()).collect();
+        self.save_to_history();
+        
+        let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
         
         // Ensure we have enough lines for cursor position
         let target_size = (self.cursor_y as usize + 1).min(500);
