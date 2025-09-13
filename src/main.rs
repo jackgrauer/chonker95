@@ -281,6 +281,46 @@ impl TerminalRenderer {
         self
     }
     
+    fn draw_line_with_selection(self, x: u16, y: u16, line: &str, selection: &Selection, col_offset: u16) -> Self {
+        if !selection.active {
+            return self.draw_text_default(x, y, line);
+        }
+        
+        let ((min_x, min_y), (max_x, max_y)) = selection.normalized();
+        
+        if y >= min_y && y <= max_y {
+            let adj_min_x = min_x.saturating_sub(col_offset);
+            let adj_max_x = max_x.saturating_sub(col_offset);
+            
+            let line_chars: Vec<char> = line.chars().collect();
+            
+            // Build the line parts
+            let pre_selection = if adj_min_x > 0 {
+                line_chars.iter().take(adj_min_x as usize).collect::<String>()
+            } else {
+                String::new()
+            };
+            
+            let selection_content = line_chars.iter()
+                .skip(adj_min_x as usize)
+                .take((adj_max_x - adj_min_x + 1) as usize)
+                .collect::<String>();
+                
+            let post_selection = line_chars.iter()
+                .skip((adj_max_x + 1) as usize)
+                .collect::<String>();
+            
+            // Render in parts
+            execute!(io::stdout(), cursor::MoveTo(x, y), Print(&pre_selection)).ok();
+            execute!(io::stdout(), SetBackgroundColor(Color::Blue), SetForegroundColor(Color::White), Print(&selection_content), ResetColor).ok();
+            execute!(io::stdout(), Print(&post_selection)).ok();
+        } else {
+            execute!(io::stdout(), cursor::MoveTo(x, y), Print(line)).ok();
+        }
+        
+        self
+    }
+    
     fn render(self) {
         io::stdout().flush().ok();
     }
@@ -659,15 +699,50 @@ impl WysiwygEditor {
     }
     
     
-    fn apply_spatial_to_selection(&mut self) -> Result<()> {
-        if !self.selection.active {
-            return Ok(());
+    fn handle_image_pane_input(&mut self, key: KeyCode) -> Result<bool> {
+        if !self.ab_mode || self.active_pane != ActivePane::Image {
+            return Ok(false);
         }
         
-        // TODO: Apply spatial layout to selected text block
-        // This will extract elements in the selection area and re-layout them spatially
-        
-        Ok(())
+        match key {
+            KeyCode::Char('=') | KeyCode::Char('+') => {
+                self.zoom_in()?;
+                Ok(true)
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                self.zoom_out()?;
+                Ok(true)
+            }
+            KeyCode::Char('0') => {
+                self.reset_zoom()?;
+                Ok(true)
+            }
+            KeyCode::Up => {
+                self.pan_offset_y -= 5;
+                self.pdf_image_rendered = false;
+                self.render_pdf_image()?;
+                Ok(true)
+            }
+            KeyCode::Down => {
+                self.pan_offset_y += 5;
+                self.pdf_image_rendered = false;
+                self.render_pdf_image()?;
+                Ok(true)
+            }
+            KeyCode::Left => {
+                self.pan_offset_x -= 5;
+                self.pdf_image_rendered = false;
+                self.render_pdf_image()?;
+                Ok(true)
+            }
+            KeyCode::Right => {
+                self.pan_offset_x += 5;
+                self.pdf_image_rendered = false;
+                self.render_pdf_image()?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
     
     
@@ -1166,7 +1241,7 @@ impl WysiwygEditor {
             // Mode operations
             (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
                 self.ab_mode = !self.ab_mode;
-                self.is_selecting = false;
+                self.selection.clear();
                 if self.ab_mode {
                     self.pdf_image_rendered = false;
                     self.active_pane = ActivePane::Image;
@@ -1212,11 +1287,7 @@ impl WysiwygEditor {
                 return Ok(false);
             }
             
-            // Selection and editing
-            (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
-                self.apply_spatial_to_selection()?;
-                return Ok(false);
-            }
+            // Selection and editing - removed spatial selection stub
             
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 if self.selection.active {
@@ -1261,47 +1332,9 @@ impl WysiwygEditor {
             _ => {} // Fall through to other handlers
         }
         
-        // Handle image pane controls (when image pane is active)
-        if self.ab_mode && self.active_pane == ActivePane::Image {
-            match key {
-                KeyCode::Char('=') | KeyCode::Char('+') => {
-                    self.zoom_in()?;
-                    return Ok(false);
-                }
-                KeyCode::Char('-') | KeyCode::Char('_') => {
-                    self.zoom_out()?;
-                    return Ok(false);
-                }
-                KeyCode::Char('0') => {
-                    self.reset_zoom()?;
-                    return Ok(false);
-                }
-                KeyCode::Up => {
-                    self.pan_offset_y -= 5;
-                    self.pdf_image_rendered = false;
-                    self.render_pdf_image()?;
-                    return Ok(false);
-                }
-                KeyCode::Down => {
-                    self.pan_offset_y += 5;
-                    self.pdf_image_rendered = false;
-                    self.render_pdf_image()?;
-                    return Ok(false);
-                }
-                KeyCode::Left => {
-                    self.pan_offset_x -= 5;
-                    self.pdf_image_rendered = false;
-                    self.render_pdf_image()?;
-                    return Ok(false);
-                }
-                KeyCode::Right => {
-                    self.pan_offset_x += 5;
-                    self.pdf_image_rendered = false;
-                    self.render_pdf_image()?;
-                    return Ok(false);
-                }
-                _ => {}
-            }
+        // Handle image pane controls with dedicated method
+        if self.handle_image_pane_input(key)? {
+            return Ok(false);
         }
         
         // Handle text input (when text pane is active OR not in A-B mode)
@@ -1418,9 +1451,8 @@ impl WysiwygEditor {
     }
     
     fn insert_char_at_cursor(&mut self, c: char) -> Result<()> {
-        // Save state before modifying
-        self.save_to_history();
-        let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
+        self.with_history(|editor| {
+            let mut lines: Vec<String> = editor.text_buffer.lines().map(|s| s.to_string()).collect();
         
         // Ensure we have enough lines for cursor position
         let target_size = (self.cursor_y as usize + 1).min(500);
@@ -1539,17 +1571,7 @@ impl WysiwygEditor {
         let mut lines: Vec<String> = self.text_buffer.lines().map(|s| s.to_string()).collect();
         
         // Normalize selection bounds
-        let (start_y, end_y) = if self.selection_start_y <= self.selection_end_y {
-            (self.selection_start_y, self.selection_end_y)
-        } else {
-            (self.selection_end_y, self.selection_start_y)
-        };
-        
-        let (start_x, end_x) = if self.selection_start_x <= self.selection_end_x {
-            (self.selection_start_x, self.selection_end_x)
-        } else {
-            (self.selection_end_x, self.selection_start_x)
-        };
+        let ((start_x, start_y), (end_x, end_y)) = self.selection.normalized();
         
         // Delete the selected block
         for y in start_y..=end_y {
@@ -1574,7 +1596,7 @@ impl WysiwygEditor {
         }
         
         self.text_buffer = lines.join("\n");
-        self.is_selecting = false;
+        self.selection.clear();
         
         Ok(())
     }
@@ -1795,7 +1817,7 @@ impl WysiwygEditor {
         self.current_page = 1;
         self.total_pages = 1; // Will be updated in load_page
         self.pdf_image_rendered = false;
-        self.is_selecting = false;
+        self.selection.clear();
         self.cursor_x = 0;
         self.cursor_y = 0;
         // Keep current zoom level when switching files
@@ -1871,6 +1893,13 @@ impl WysiwygEditor {
     
     
     
+    
+    fn with_history<F>(&mut self, f: F) -> Result<()> 
+    where F: FnOnce(&mut Self) -> Result<()>
+    {
+        self.save_to_history();
+        f(self)
+    }
     
     fn save_to_history(&mut self) {
         // Truncate history if we're not at the latest position
