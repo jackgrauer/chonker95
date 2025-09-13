@@ -1055,7 +1055,8 @@ impl WysiwygEditor {
         let split_x = self.terminal_width / 2;
         
         // Left side: PDF image area 
-        if !self.pdf_image_rendered {
+        let image_rendered = matches!(self.mode, EditorMode::SplitScreen { image_rendered: true, .. });
+        if !image_rendered {
             TerminalRenderer::new()
                 .draw_text(2, 2, "Loading PDF image...", Color::Cyan)
                 .draw_text(2, 4, &format!("Page: {}", self.current_page), Color::Yellow)
@@ -1068,9 +1069,9 @@ impl WysiwygEditor {
         }
         
         // Clean vertical separator with subtle focus indication
-        let separator_color = match self.active_pane {
-            ActivePane::Image => Color::Blue,    // Subtle blue for image focus
-            ActivePane::Text => Color::DarkGrey, // Muted for text focus
+        let separator_color = match &self.mode {
+            EditorMode::SplitScreen { active_pane: ActivePane::Image, .. } => Color::Blue,
+            _ => Color::DarkGrey,
         };
         
         let mut renderer = TerminalRenderer::new();
@@ -1210,7 +1211,7 @@ impl WysiwygEditor {
     
     fn handle_key_input(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         // Handle file picker input separately
-        if self.file_picker_open {
+        if matches!(self.mode, EditorMode::FilePicker { .. }) {
             return self.handle_file_picker_input(key, modifiers);
         }
         
@@ -1229,7 +1230,15 @@ impl WysiwygEditor {
             
             // File operations
             (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                self.open_file_picker()?;
+                let current_path = self.pdf_path.parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+                self.mode = EditorMode::FilePicker {
+                    path: current_path,
+                    files: Vec::new(),
+                    selected: 0,
+                };
+                self.scan_directory()?;
                 return Ok(false);
             }
             
@@ -1324,8 +1333,8 @@ impl WysiwygEditor {
             
             // Pane switching
             (KeyCode::Tab, KeyModifiers::NONE) => {
-                if self.ab_mode {
-                    self.active_pane = match self.active_pane {
+                if let EditorMode::SplitScreen { active_pane, .. } = &mut self.mode {
+                    *active_pane = match active_pane {
                         ActivePane::Image => ActivePane::Text,
                         ActivePane::Text => ActivePane::Image,
                     };
@@ -1341,9 +1350,15 @@ impl WysiwygEditor {
             return Ok(false);
         }
         
-        // Handle text input (when text pane is active OR not in A-B mode)
-        if !self.ab_mode || self.active_pane == ActivePane::Text {
-            self.handle_text_input(key, modifiers)?;
+        // Handle text input based on mode
+        match &self.mode {
+            EditorMode::Text { .. } => {
+                self.handle_text_input(key, modifiers)?;
+            }
+            EditorMode::SplitScreen { active_pane: ActivePane::Text, .. } => {
+                self.handle_text_input(key, modifiers)?;
+            }
+            _ => {} // No text input in other modes
         }
         
         Ok(false)
@@ -1439,13 +1454,17 @@ impl WysiwygEditor {
                 }
             }
             KeyCode::PageUp => {
-                if !self.ab_mode {
-                    self.scroll_up()?;
+                if let EditorMode::Text { scroll_offset } = &mut self.mode {
+                    let page_size = (self.terminal_height - 1) as usize;
+                    *scroll_offset = scroll_offset.saturating_sub(page_size);
                 }
             }
             KeyCode::PageDown => {
-                if !self.ab_mode {
-                    self.scroll_down()?;
+                if let EditorMode::Text { scroll_offset } = &mut self.mode {
+                    let page_size = (self.terminal_height - 1) as usize;
+                    let total_lines = self.text_buffer.lines().count();
+                    let max_scroll = total_lines.saturating_sub(page_size);
+                    *scroll_offset = (*scroll_offset + page_size).min(max_scroll);
                 }
             }
             _ => {}
@@ -1665,80 +1684,79 @@ impl WysiwygEditor {
     }
     
     fn scan_directory(&mut self) -> Result<()> {
-        self.file_list.clear();
-        
-        // Add parent directory entry if not at root
-        if let Some(parent) = self.file_picker_path.parent() {
-            if parent != self.file_picker_path {
-                let mut parent_path = parent.to_path_buf();
-                parent_path.push("..");
-                self.file_list.push(parent_path);
-            }
-        }
-        
-        // Read directory contents
-        if let Ok(entries) = std::fs::read_dir(&self.file_picker_path) {
-            let mut dirs = Vec::new();
-            let mut files = Vec::new();
+        if let EditorMode::FilePicker { path, files, selected } = &mut self.mode {
+            files.clear();
             
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                } else if let Some(ext) = path.extension() {
-                    if ext.to_string_lossy().to_lowercase() == "pdf" {
-                        files.push(path);
-                    }
+            // Add parent directory entry if not at root
+            if let Some(parent) = path.parent() {
+                if parent != path.as_path() {
+                    let mut parent_path = parent.to_path_buf();
+                    parent_path.push("..");
+                    files.push(parent_path);
                 }
             }
             
-            // Sort directories and files separately
-            dirs.sort();
-            files.sort();
+            // Read directory contents
+            if let Ok(entries) = std::fs::read_dir(path) {
+                let mut dirs = Vec::new();
+                let mut pdf_files = Vec::new();
+                
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() {
+                        dirs.push(entry_path);
+                    } else if let Some(ext) = entry_path.extension() {
+                        if ext.to_string_lossy().to_lowercase() == "pdf" {
+                            pdf_files.push(entry_path);
+                        }
+                    }
+                }
+                
+                // Sort directories and files separately
+                dirs.sort();
+                pdf_files.sort();
+                
+                // Add to file list (directories first, then PDFs)
+                files.extend(dirs);
+                files.extend(pdf_files);
+            }
             
-            // Add to file list (directories first, then PDFs)
-            self.file_list.extend(dirs);
-            self.file_list.extend(files);
+            // Reset selection to first item
+            *selected = 0;
         }
-        
-        // Reset selection to first item
-        self.file_picker_selected = 0;
         
         Ok(())
     }
     
     fn render_file_picker(&self) -> Result<()> {
-        execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        let (path, files, selected) = match &self.mode {
+            EditorMode::FilePicker { path, files, selected } => (path, files, selected),
+            _ => return Ok(()),
+        };
         
-        // Header
-        execute!(
-            io::stdout(),
-            SetForegroundColor(Color::Cyan),
-            Print("📁 File Picker"),
-            ResetColor,
-            cursor::MoveTo(0, 1),
-            SetForegroundColor(Color::DarkGrey),
-            Print(format!("Current: {}", self.file_picker_path.display())),
-            ResetColor
-        )?;
+        TerminalRenderer::new()
+            .clear_screen()
+            .draw_text(0, 0, "📁 File Picker", Color::Cyan)
+            .draw_text(0, 1, &format!("Current: {}", path.display()), Color::DarkGrey)
+            .render();
         
         // File list
         let list_start = 3;
         let visible_lines = (self.terminal_height - 5) as usize; // Leave room for header and footer
-        let start_index = if self.file_picker_selected >= visible_lines {
-            self.file_picker_selected - visible_lines + 1
+        let start_index = if *selected >= visible_lines {
+            *selected - visible_lines + 1
         } else {
             0
         };
         
-        for (i, path) in self.file_list.iter().skip(start_index).take(visible_lines).enumerate() {
+        for (i, file_path) in files.iter().skip(start_index).take(visible_lines).enumerate() {
             let display_index = start_index + i;
             let y = list_start + i as u16;
             
             execute!(io::stdout(), cursor::MoveTo(0, y))?;
             
-            let is_selected = display_index == self.file_picker_selected;
-            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            let is_selected = display_index == *selected;
+            let filename = file_path.file_name().unwrap_or_default().to_string_lossy();
             
             if is_selected {
                 execute!(
@@ -1749,7 +1767,7 @@ impl WysiwygEditor {
             }
             
             // Icon and name
-            if path.is_dir() || filename == ".." {
+            if file_path.is_dir() || filename == ".." {
                 execute!(io::stdout(), Print(format!("📁 {}", filename)))?;
             } else {
                 execute!(io::stdout(), Print(format!("📄 {}", filename)))?;
@@ -1772,45 +1790,45 @@ impl WysiwygEditor {
         Ok(())
     }
     
-    fn open_file_picker(&mut self) -> Result<()> {
-        self.file_picker_open = true;
-        self.scan_directory()?;
-        Ok(())
-    }
     
     fn handle_file_picker_input(&mut self, key: KeyCode, _modifiers: KeyModifiers) -> Result<bool> {
+        let (path, files, selected) = match &mut self.mode {
+            EditorMode::FilePicker { path, files, selected } => (path, files, selected),
+            _ => return Ok(false),
+        };
+        
         match key {
             KeyCode::Up => {
-                if self.file_picker_selected > 0 {
-                    self.file_picker_selected -= 1;
+                if *selected > 0 {
+                    *selected -= 1;
                 }
             }
             KeyCode::Down => {
-                if self.file_picker_selected + 1 < self.file_list.len() {
-                    self.file_picker_selected += 1;
+                if *selected + 1 < files.len() {
+                    *selected += 1;
                 }
             }
             KeyCode::Enter => {
-                if let Some(selected_path) = self.file_list.get(self.file_picker_selected).cloned() {
+                if let Some(selected_path) = files.get(*selected).cloned() {
                     if selected_path.file_name().unwrap_or_default() == ".." {
                         // Navigate to parent directory
-                        if let Some(parent) = self.file_picker_path.parent() {
-                            self.file_picker_path = parent.to_path_buf();
+                        if let Some(parent) = path.parent() {
+                            *path = parent.to_path_buf();
                             self.scan_directory()?;
                         }
                     } else if selected_path.is_dir() {
                         // Navigate into directory
-                        self.file_picker_path = selected_path;
+                        *path = selected_path;
                         self.scan_directory()?;
                     } else if selected_path.extension().map(|ext| ext.to_string_lossy().to_lowercase()) == Some("pdf".to_string()) {
                         // Load the PDF file
                         self.load_new_file(selected_path)?;
-                        self.file_picker_open = false;
+                        self.mode = EditorMode::Text { scroll_offset: 0 };
                     }
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
-                self.file_picker_open = false;
+                self.mode = EditorMode::Text { scroll_offset: 0 };
             }
             _ => {}
         }
@@ -1821,7 +1839,10 @@ impl WysiwygEditor {
         self.pdf_path = path;
         self.current_page = 1;
         self.total_pages = 1; // Will be updated in load_page
-        self.pdf_image_rendered = false;
+        // Reset any SplitScreen image rendering state
+        if let EditorMode::SplitScreen { image_rendered, .. } = &mut self.mode {
+            *image_rendered = false;
+        }
         self.selection.clear();
         self.cursor_x = 0;
         self.cursor_y = 0;
@@ -1842,12 +1863,11 @@ impl WysiwygEditor {
         
         if new_zoom <= 800 { // Max zoom limit
             self.zoom_level = new_zoom;
-            self.pan_offset_x = 0; // Reset pan when zoom changes
-            self.pan_offset_y = 0;
-            self.pdf_image_rendered = false; // Always force re-render at new resolution
             
-            // If in A-B mode, immediately re-render the image
-            if self.ab_mode {
+            // Reset pan and force re-render if in SplitScreen mode
+            if let EditorMode::SplitScreen { pan_offset, image_rendered, .. } = &mut self.mode {
+                *pan_offset = (0, 0); // Reset pan when zoom changes
+                *image_rendered = false; // Always force re-render at new resolution
                 self.render_pdf_image()?;
             }
         }
@@ -1867,12 +1887,11 @@ impl WysiwygEditor {
         
         if new_zoom >= 50 { // Min zoom limit
             self.zoom_level = new_zoom;
-            self.pan_offset_x = 0; // Reset pan when zoom changes
-            self.pan_offset_y = 0;
-            self.pdf_image_rendered = false; // Always force re-render at new resolution
             
-            // If in A-B mode, immediately re-render the image
-            if self.ab_mode {
+            // Reset pan and force re-render if in SplitScreen mode
+            if let EditorMode::SplitScreen { pan_offset, image_rendered, .. } = &mut self.mode {
+                *pan_offset = (0, 0); // Reset pan when zoom changes
+                *image_rendered = false; // Always force re-render at new resolution
                 self.render_pdf_image()?;
             }
         }
@@ -1883,12 +1902,11 @@ impl WysiwygEditor {
     fn reset_zoom(&mut self) -> Result<()> {
         if self.zoom_level != 100 {
             self.zoom_level = 100;
-            self.pan_offset_x = 0; // Reset pan when zoom resets
-            self.pan_offset_y = 0;
-            self.pdf_image_rendered = false; // Always force re-render at normal resolution
             
-            // If in A-B mode, immediately re-render the image
-            if self.ab_mode {
+            // Reset pan and force re-render if in SplitScreen mode
+            if let EditorMode::SplitScreen { pan_offset, image_rendered, .. } = &mut self.mode {
+                *pan_offset = (0, 0); // Reset pan when zoom resets
+                *image_rendered = false; // Always force re-render at normal resolution
                 self.render_pdf_image()?;
             }
         }
@@ -1977,21 +1995,6 @@ impl WysiwygEditor {
         
         Ok(())
     }
-    
-    fn scroll_up(&mut self) -> Result<()> {
-        let page_size = (self.terminal_height - 1) as usize;
-        self.scroll_offset = self.scroll_offset.saturating_sub(page_size);
-        Ok(())
-    }
-    
-    fn scroll_down(&mut self) -> Result<()> {
-        let page_size = (self.terminal_height - 1) as usize;
-        let total_lines = self.text_buffer.lines().count();
-        let max_scroll = total_lines.saturating_sub(page_size);
-        
-        self.scroll_offset = (self.scroll_offset + page_size).min(max_scroll);
-        Ok(())
-    }
 }
 
 fn main() -> Result<()> {
@@ -2004,8 +2007,8 @@ fn main() -> Result<()> {
     let mut editor = WysiwygEditor::new(cli.file, cli.page)?;
     
     loop {
-        // Render PDF image if we're in A-B mode and haven't rendered yet
-        if editor.ab_mode && !editor.pdf_image_rendered {
+        // Render PDF image if we're in SplitScreen mode and haven't rendered yet
+        if let EditorMode::SplitScreen { image_rendered: false, .. } = &editor.mode {
             editor.render_pdf_image()?;
         }
         
