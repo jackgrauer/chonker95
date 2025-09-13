@@ -7,8 +7,10 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetForegroundColor, SetBackgroundColor},
     terminal::{self, Clear, ClearType},
 };
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use quick_xml::{Reader, events::{Event as XmlEvent, BytesStart}};
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -27,10 +29,10 @@ enum ActivePane {
     Text,   // Right pane - text editing
 }
 
+// Only Flow mode - spatial will be applied to selected blocks
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LayoutMode {
-    Spatial,    // Perfect tables, some word spacing issues
-    Sequential, // Perfect text flow, table alignment issues
+    Flow, // Natural text flow - always the mode
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +53,392 @@ struct AltoElement {
 enum ElementType {
     Text,
     Space,
+}
+
+trait LayoutStrategy {
+    fn layout(&self, elements: &[AltoElement], context: &LayoutContext) -> String;
+}
+
+struct LayoutContext {
+    page_bounds: (f32, f32, f32, f32, f32, f32),
+    terminal_dims: (usize, usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PageBounds {
+    min_h: f32,
+    max_h: f32,
+    min_v: f32,
+    max_v: f32,
+    width: f32,
+    height: f32,
+    scale_x: f32,
+    scale_y: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Coordinates {
+    pdf: (f32, f32),
+    terminal: (u16, u16),
+}
+
+impl Coordinates {
+    fn from_alto(element: &AltoElement, bounds: &PageBounds, terminal_dims: (usize, usize)) -> Self {
+        let x = if bounds.width > 0.0 {
+            ((element.hpos - bounds.min_h) * (terminal_dims.0 - 10) as f32 / bounds.width) as u16
+        } else { 0 }.min((terminal_dims.0 - 1) as u16);
+        
+        let y = if bounds.height > 0.0 {
+            ((element.vpos - bounds.min_v) * (terminal_dims.1 - 5) as f32 / bounds.height) as u16
+        } else { 0 }.min((terminal_dims.1 - 1) as u16);
+        
+        Self {
+            pdf: (element.hpos, element.vpos),
+            terminal: (x, y),
+        }
+    }
+}
+
+impl PageBounds {
+    fn new(elements: &[AltoElement], terminal_dims: (usize, usize)) -> Self {
+        if elements.is_empty() {
+            return Self {
+                min_h: 0.0, max_h: 0.0, min_v: 0.0, max_v: 0.0,
+                width: 0.0, height: 0.0, scale_x: 1.0, scale_y: 1.0,
+            };
+        }
+        
+        // Fast single-pass bounds calculation
+        let mut min_h = f32::INFINITY;
+        let mut max_h = f32::NEG_INFINITY;
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        
+        for element in elements {
+            min_h = min_h.min(element.hpos);
+            max_h = max_h.max(element.hpos + element._width);
+            min_v = min_v.min(element.vpos);
+            max_v = max_v.max(element.vpos + element._height);
+        }
+        
+        let width = max_h - min_h;
+        let height = max_v - min_v;
+        
+        // Calculate scale factors for terminal mapping
+        let scale_x = if width > 0.0 { (terminal_dims.0 - 10) as f32 / width } else { 1.0 };
+        let scale_y = if height > 0.0 { (terminal_dims.1 - 5) as f32 / height } else { 1.0 };
+        
+        Self {
+            min_h, max_h, min_v, max_v, width, height, scale_x, scale_y
+        }
+    }
+}
+
+struct FlowLayout;
+struct SpatialLayout;
+
+#[derive(Clone, Copy)]
+struct Selection {
+    start: (u16, u16),
+    end: (u16, u16),
+    active: bool,
+}
+
+impl Selection {
+    fn new() -> Self {
+        Self {
+            start: (0, 0),
+            end: (0, 0),
+            active: false,
+        }
+    }
+    
+    fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        let (sx, sy) = self.start;
+        let (ex, ey) = self.end;
+        (
+            (sx.min(ex), sy.min(ey)),
+            (sx.max(ex), sy.max(ey))
+        )
+    }
+    
+    fn contains(&self, x: u16, y: u16) -> bool {
+        if !self.active {
+            return false;
+        }
+        let ((min_x, min_y), (max_x, max_y)) = self.normalized();
+        x >= min_x && x <= max_x && y >= min_y && y <= max_y
+    }
+    
+    fn extract_text(&self, buffer: &str) -> String {
+        if !self.active {
+            return String::new();
+        }
+        
+        let ((min_x, min_y), (max_x, max_y)) = self.normalized();
+        buffer.lines()
+            .skip(min_y as usize)
+            .take((max_y - min_y + 1) as usize)
+            .map(|line| {
+                let chars: Vec<char> = line.chars().collect();
+                let start_idx = (min_x as usize).min(chars.len());
+                let end_idx = ((max_x + 1) as usize).min(chars.len());
+                if end_idx > start_idx {
+                    chars[start_idx..end_idx].iter().collect()
+                } else {
+                    String::new()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    
+    fn start_at(&mut self, x: u16, y: u16) {
+        self.start = (x, y);
+        self.end = (x, y);
+        self.active = true;
+    }
+    
+    fn extend_to(&mut self, x: u16, y: u16) {
+        if self.active {
+            self.end = (x, y);
+        }
+    }
+    
+    fn clear(&mut self) {
+        self.active = false;
+    }
+}
+
+struct TerminalRenderer {
+    _buffer: Vec<String>, // For future batching if needed
+}
+
+impl TerminalRenderer {
+    fn new() -> Self {
+        Self { _buffer: Vec::new() }
+    }
+    
+    fn clear_screen(self) -> Self {
+        execute!(io::stdout(), Clear(ClearType::All)).ok();
+        self
+    }
+    
+    fn clear_area(self, x: u16, y: u16, width: usize, height: usize) -> Self {
+        for row in 0..height {
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(x, y + row as u16),
+                Print(" ".repeat(width))
+            ).ok();
+        }
+        self
+    }
+    
+    fn draw_text(self, x: u16, y: u16, text: &str, color: Color) -> Self {
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(x, y),
+            SetForegroundColor(color),
+            Print(text),
+            ResetColor
+        ).ok();
+        self
+    }
+    
+    fn draw_text_default(self, x: u16, y: u16, text: &str) -> Self {
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(x, y),
+            Print(text)
+        ).ok();
+        self
+    }
+    
+    fn draw_status_line(self, y: u16, text: &str) -> Self {
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(text),
+            ResetColor
+        ).ok();
+        self
+    }
+    
+    fn move_cursor(self, x: u16, y: u16) -> Self {
+        execute!(io::stdout(), cursor::MoveTo(x, y)).ok();
+        self
+    }
+    
+    fn show_cursor(self) -> Self {
+        execute!(io::stdout(), cursor::Show).ok();
+        self
+    }
+    
+    fn hide_cursor(self) -> Self {
+        execute!(io::stdout(), cursor::Hide).ok();
+        self
+    }
+    
+    fn render(self) {
+        io::stdout().flush().ok();
+    }
+}
+
+impl LayoutStrategy for FlowLayout {
+    fn layout(&self, elements: &[AltoElement], context: &LayoutContext) -> String {
+        let bounds = PageBounds::new(elements, context.terminal_dims);
+        let page_center = bounds.min_h + (bounds.width / 2.0);
+        
+        // Group elements by line with better clustering
+        let mut lines_map = std::collections::HashMap::new();
+        for element in elements {
+            let line_y = ((element.vpos - bounds.min_v) / 8.0) as usize; // Tighter line grouping
+            lines_map.entry(line_y).or_insert_with(Vec::new).push(element.clone());
+        }
+        
+        let mut output_lines = Vec::new();
+        let char_width = 6.0;
+        let terminal_width = 80;
+        let mut last_vpos = 0.0;
+        
+        for y in 0..60 {
+            if let Some(mut line_elements) = lines_map.remove(&y) {
+                // Sort by horizontal position
+                line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap_or(std::cmp::Ordering::Equal));
+                
+                // Check for paragraph breaks based on vertical gap
+                let current_vpos = line_elements.first().map(|e| e.vpos).unwrap_or(0.0);
+                let vpos_gap = current_vpos - last_vpos;
+                
+                // Add paragraph breaks for large gaps
+                if last_vpos > 0.0 && vpos_gap > 20.0 {
+                    output_lines.push(String::new()); // Empty line for paragraph break
+                }
+                
+                // Build line with proper spacing
+                let mut line_output = String::new();
+                for element in &line_elements {
+                    match element.element_type {
+                        ElementType::Text => {
+                            line_output.push_str(element.content.trim());
+                        }
+                        ElementType::Space => {
+                            let space_count = (element._width / char_width).round().max(1.0) as usize;
+                            for _ in 0..space_count.min(3) { line_output.push(' '); }
+                        }
+                    }
+                }
+                
+                // Check if line should be centered (like titles, table headers)
+                if Self::is_line_centered(&line_elements, page_center, bounds.width) {
+                    let padding = ((terminal_width as i32 - line_output.len() as i32) / 2).max(0) as usize;
+                    let mut padded = String::with_capacity(padding + line_output.len());
+                    padded.push_str(&" ".repeat(padding));
+                    padded.push_str(&line_output);
+                    line_output = padded;
+                }
+                
+                output_lines.push(line_output);
+                last_vpos = current_vpos;
+            }
+        }
+        
+        // Remove trailing empty lines
+        while output_lines.last() == Some(&String::new()) {
+            output_lines.pop();
+        }
+        
+        output_lines.join("\n")
+    }
+}
+
+impl FlowLayout {
+    fn is_line_centered(line: &[AltoElement], page_center: f32, page_width: f32) -> bool {
+        if line.is_empty() {
+            return false;
+        }
+        
+        // Calculate the center of this line's text
+        let line_start = line.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
+        let line_end = line.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
+        let line_center = line_start + ((line_end - line_start) / 2.0);
+        
+        // Consider it centered if within 15% of page center
+        let tolerance = page_width * 0.15;
+        let distance_from_center = (line_center - page_center).abs();
+        
+        // Also check if line is significantly shorter than full width (typical for centered content)
+        let line_width = line_end - line_start;
+        let is_short_line = line_width < (page_width * 0.7);
+        
+        distance_from_center < tolerance && is_short_line
+    }
+}
+
+impl LayoutStrategy for SpatialLayout {
+    fn layout(&self, elements: &[AltoElement], context: &LayoutContext) -> String {
+        let bounds = PageBounds::new(elements, context.terminal_dims);
+        
+        // Dynamic grid sizing based on actual content bounds
+        let terminal_width = ((bounds.width / 6.0) as usize + 20).min(200).max(80);
+        let terminal_height = ((bounds.height / 12.0) as usize + 10).min(100).max(30);
+        
+        let mut grid = vec![' '; terminal_width * terminal_height];
+        
+        // Map each element to terminal grid using coordinate struct
+        for element in elements {
+            let content = if element.content == " " {
+                " "
+            } else {
+                element.content.trim()
+            };
+            
+            if content.is_empty() && element.content != " " {
+                continue;
+            }
+            
+            // Use clean coordinate conversion
+            let coords = Coordinates::from_alto(element, &bounds, (terminal_width, terminal_height));
+            let x = coords.terminal.0 as usize;
+            let y = coords.terminal.1 as usize;
+            
+            if y < terminal_height && x < terminal_width && !content.is_empty() {
+                let grid_idx = y * terminal_width + x;
+                if grid_idx < grid.len() {
+                    if element.content == " " {
+                        if grid[grid_idx] == ' ' {
+                            grid[grid_idx] = ' ';
+                        }
+                    } else {
+                        // For text elements, place character by character
+                        for (i, ch) in content.char_indices() {
+                            let pos_x = x + i;
+                            if pos_x < terminal_width {
+                                let pos_idx = y * terminal_width + pos_x;
+                                if pos_idx < grid.len() {
+                                    let has_priority = grid[pos_idx] == ' ' || 
+                                        element.content.chars().any(|c| c.is_numeric() || c == '$' || c == '%');
+                                    if has_priority {
+                                        grid[pos_idx] = ch;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Convert flat grid to text efficiently  
+        let buffer_lines: Vec<String> = grid.chunks(terminal_width)
+            .map(|row| row.iter().collect::<String>().trim_end_matches(' ').to_owned())
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+            
+        buffer_lines.join("\n")
+    }
 }
 
 impl AltoElement {
@@ -78,6 +466,27 @@ impl AltoElement {
             element_type,
         }
     }
+    
+    fn from_attrs(attrs: HashMap<String, String>, element_type: ElementType) -> Self {
+        let content = match element_type {
+            ElementType::Text => attrs.get("CONTENT").cloned().unwrap_or_default(),
+            ElementType::Space => " ".to_string(),
+        };
+        
+        let hpos = attrs.get("HPOS").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let vpos = attrs.get("VPOS").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let width = attrs.get("WIDTH").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let height = attrs.get("HEIGHT").and_then(|v| v.parse().ok()).unwrap_or(10.0);
+        
+        Self::new(
+            format!("elem_{}", hpos as u32), // Simple ID based on position
+            content,
+            hpos,
+            vpos,
+            width,
+            height,
+        )
+    }
 }
 
 struct WysiwygEditor {
@@ -95,12 +504,8 @@ struct WysiwygEditor {
     pdf_image_rendered: bool,
     // Dark mode for PDF display
     dark_mode: bool,
-    // Block text selection (always on)
-    selection_start_x: u16,
-    selection_start_y: u16,
-    selection_end_x: u16,
-    selection_end_y: u16,
-    is_selecting: bool,
+    // Block text selection
+    selection: Selection,
     // Clipboard for copy/paste
     clipboard: Vec<String>,
     // File picker
@@ -145,11 +550,7 @@ impl WysiwygEditor {
             ab_mode: false,
             pdf_image_rendered: false,
             dark_mode: true, // Default to dark mode
-            selection_start_x: 0,
-            selection_start_y: 0,
-            selection_end_x: 0,
-            selection_end_y: 0,
-            is_selecting: false,
+            selection: Selection::new(),
             clipboard: Vec::new(),
             file_picker_open: false,
             file_list: Vec::new(),
@@ -161,9 +562,9 @@ impl WysiwygEditor {
             pan_offset_y: 0,
             history: Vec::new(),
             history_index: -1,
-            layout_mode: LayoutMode::Spatial, // Start with good tables
+            layout_mode: LayoutMode::Flow, // Start with natural text flow
             text_buffer_dirty: true, // Needs initial build
-            last_layout_mode: LayoutMode::Spatial,
+            last_layout_mode: LayoutMode::Flow,
             scroll_offset: 0,
             total_pages: 1, // Will be updated after loading
         };
@@ -219,91 +620,20 @@ impl WysiwygEditor {
             return;
         }
         
-        match self.layout_mode {
-            LayoutMode::Spatial => self.rebuild_spatial_layout(),
-            LayoutMode::Sequential => self.rebuild_sequential_layout(),
-        }
+        let context = LayoutContext {
+            page_bounds: self.calculate_page_bounds(),
+            terminal_dims: (self.terminal_width as usize, self.terminal_height as usize),
+        };
+        
+        // Always use Flow layout for the whole document
+        let strategy = FlowLayout;
+        self.text_buffer = strategy.layout(&self.elements, &context);
         
         // Mark as clean and update last mode
         self.text_buffer_dirty = false;
         self.last_layout_mode = self.layout_mode;
     }
     
-    fn rebuild_spatial_layout(&mut self) {
-        let (min_hpos, _max_hpos, min_vpos, _max_vpos, page_width, page_height) = self.calculate_page_bounds();
-        
-        // Dynamic grid sizing based on actual content bounds
-        let terminal_width = ((page_width / 6.0) as usize + 20).min(200).max(80); // Adaptive width
-        let terminal_height = ((page_height / 12.0) as usize + 10).min(100).max(30); // Adaptive height
-        
-        let mut grid = vec![' '; terminal_width * terminal_height]; // Flat grid for speed
-        
-
-        // Map each element to terminal grid using precise coordinates (RESTORE HIGH WATERMARK)
-        for element in &self.elements {
-            // Don't skip spaces anymore - they're important for layout
-            let content = if element.content == " " {
-                " " // Preserve space elements as-is
-            } else {
-                element.content.trim()
-            };
-            
-            if content.is_empty() && element.content != " " {
-                continue; // Skip only truly empty content, not spaces
-            }
-            
-            // Fast integer coordinate mapping
-            let x = if page_width > 0.0 {
-                (((element.hpos - min_hpos) * (terminal_width - 10) as f32) / page_width) as usize
-            } else { 0 }.min(terminal_width.saturating_sub(1));
-            
-            let y = if page_height > 0.0 {
-                (((element.vpos - min_vpos) * (terminal_height - 5) as f32) / page_height) as usize
-            } else { 0 }.min(terminal_height.saturating_sub(1));
-            
-            // Place text in grid, handling overlaps
-            let content = if element.content == " " {
-                " " // Preserve space elements as-is
-            } else {
-                element.content.trim()
-            };
-            
-            if y < terminal_height && x < terminal_width && !content.is_empty() {
-                let grid_idx = y * terminal_width + x;
-                if grid_idx < grid.len() {
-                    // For space elements, just place a single space
-                    if element.content == " " {
-                        if grid[grid_idx] == ' ' { // Only place space if position is empty
-                            grid[grid_idx] = ' ';
-                        }
-                    } else {
-                        // For text elements, place character by character
-                        for (i, ch) in content.char_indices() {
-                            let pos_x = x + i;
-                            if pos_x < terminal_width {
-                                let pos_idx = y * terminal_width + pos_x;
-                                if pos_idx < grid.len() {
-                                    // Only overwrite spaces or if element has priority (inlined)
-                                    let has_priority = grid[pos_idx] == ' ' || 
-                                        element.content.chars().any(|c| c.is_numeric() || c == '$' || c == '%');
-                                    if has_priority {
-                                        grid[pos_idx] = ch;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Convert flat grid to text efficiently  
-        let buffer_lines: Vec<String> = grid.chunks(terminal_width)
-            .map(|row| row.iter().collect::<String>().trim_end_matches(' ').to_owned())
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        self.text_buffer = buffer_lines.join("\n");
-    }
     
     fn calculate_page_bounds(&self) -> (f32, f32, f32, f32, f32, f32) {
         if self.elements.is_empty() {
@@ -328,103 +658,14 @@ impl WysiwygEditor {
         (min_hpos, max_hpos, min_vpos, max_vpos, page_width, page_height)
     }
     
-    fn rebuild_sequential_layout(&mut self) {
-        let (min_hpos, _max_hpos, min_vpos, _max_vpos, page_width, _page_height) = self.calculate_page_bounds();
-        let page_center = min_hpos + (page_width / 2.0);
-        
-        // Group elements by line with better clustering
-        let mut lines_map = std::collections::HashMap::new();
-        for element in &self.elements {
-            let line_y = ((element.vpos - min_vpos) / 8.0) as usize; // Tighter line grouping
-            lines_map.entry(line_y).or_insert_with(Vec::new).push(element.clone());
-        }
-        
-        let mut output_lines = Vec::new();
-        let char_width = 6.0;
-        let terminal_width = 80;
-        let mut last_vpos = 0.0;
-        
-        for y in 0..60 {
-            if let Some(mut line_elements) = lines_map.remove(&y) {
-                // Sort by horizontal position
-                line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap_or(std::cmp::Ordering::Equal));
-                
-                // Check for paragraph breaks based on vertical gap
-                let current_vpos = line_elements.first().map(|e| e.vpos).unwrap_or(0.0);
-                let vpos_gap = current_vpos - last_vpos;
-                
-                // Add paragraph breaks for large gaps
-                if last_vpos > 0.0 && vpos_gap > 20.0 {
-                    output_lines.push(String::new()); // Empty line for paragraph break
-                }
-                
-                // Build line with proper spacing
-                let mut line_output = String::new();
-                for element in &line_elements {
-                    match element.element_type {
-                        ElementType::Text => {
-                            line_output.push_str(element.content.trim());
-                        }
-                        ElementType::Space => {
-                            let space_count = (element._width / char_width).round().max(1.0) as usize;
-                            for _ in 0..space_count.min(3) { line_output.push(' '); }
-                        }
-                    }
-                }
-                
-                // Check if line should be centered (like titles, table headers)
-                if self.is_line_centered_sequential(&line_elements, page_center, page_width) {
-                    let padding = ((terminal_width as i32 - line_output.len() as i32) / 2).max(0) as usize;
-                    let mut padded = String::with_capacity(padding + line_output.len());
-                    padded.push_str(&" ".repeat(padding));
-                    padded.push_str(&line_output);
-                    line_output = padded;
-                }
-                
-                output_lines.push(line_output);
-                last_vpos = current_vpos;
-            }
-        }
-        
-        // Remove trailing empty lines
-        while output_lines.last() == Some(&String::new()) {
-            output_lines.pop();
-        }
-        
-        self.text_buffer = output_lines.join("\n");
-    }
     
-    fn is_line_centered_sequential(&self, line: &[AltoElement], page_center: f32, page_width: f32) -> bool {
-        if line.is_empty() {
-            return false;
+    fn apply_spatial_to_selection(&mut self) -> Result<()> {
+        if !self.selection.active {
+            return Ok(());
         }
         
-        // Calculate the center of this line's text
-        let line_start = line.iter().map(|e| e.hpos).fold(f32::INFINITY, f32::min);
-        let line_end = line.iter().map(|e| e.hpos + e._width).fold(f32::NEG_INFINITY, f32::max);
-        let line_center = line_start + ((line_end - line_start) / 2.0);
-        
-        // Consider it centered if within 15% of page center
-        let tolerance = page_width * 0.15;
-        let distance_from_center = (line_center - page_center).abs();
-        
-        // Also check if line is significantly shorter than full width (typical for centered content)
-        let line_width = line_end - line_start;
-        let is_short_line = line_width < (page_width * 0.7);
-        
-        distance_from_center < tolerance && is_short_line
-    }
-    
-    fn toggle_layout_mode(&mut self) -> Result<()> {
-        self.layout_mode = match self.layout_mode {
-            LayoutMode::Spatial => LayoutMode::Sequential,
-            LayoutMode::Sequential => LayoutMode::Spatial,
-        };
-        
-        // Mark as dirty and rebuild with new layout mode
-        self.text_buffer_dirty = true;
-        self.scroll_offset = 0; // Reset scroll when changing modes
-        self.rebuild_text_buffer();
+        // TODO: Apply spatial layout to selected text block
+        // This will extract elements in the selection area and re-layout them spatially
         
         Ok(())
     }
@@ -452,91 +693,49 @@ impl WysiwygEditor {
     }
     
     fn parse_alto_xml(&self, xml: &str) -> Vec<AltoElement> {
-        use quick_xml::{Reader, events::Event};
-        
-        let mut elements = Vec::new();
         let mut reader = Reader::from_str(xml);
         let mut buf = Vec::new();
-        let mut element_id = 0;
+        let mut elements = Vec::new();
         
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                    if e.name().as_ref() == b"String" {
-                        // Parse text elements
-                        let mut content = String::new();
-                        let mut hpos = 0.0;
-                        let mut vpos = 0.0;
-                        let mut width = 0.0;
-                        let mut height = 10.0;
-                        
-                        for attr in e.attributes().with_checks(false) {
-                            if let Ok(attr) = attr {
-                                let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                                let value = std::str::from_utf8(&attr.value).unwrap_or("");
-                                
-                                match key.as_ref() {
-                                    "CONTENT" => content = value.to_owned(),
-                                    "HPOS" => hpos = value.parse().unwrap_or(0.0),
-                                    "VPOS" => vpos = value.parse().unwrap_or(0.0),
-                                    "WIDTH" => width = value.parse().unwrap_or(0.0),
-                                    "HEIGHT" => height = value.parse().unwrap_or(10.0),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        
-                        if !content.is_empty() {
-                            elements.push(AltoElement::new(
-                                format!("elem_{}", element_id),
-                                content,
-                                hpos,
-                                vpos,
-                                width,
-                                height,
-                            ));
-                            element_id += 1;
-                        }
-                    } else if e.name().as_ref() == b"SP" {
-                        // Parse space elements - these are the missing word boundaries!
-                        let mut hpos = 0.0;
-                        let mut vpos = 0.0;
-                        let mut width = 3.0; // Default space width
-                        let height = 10.0;
-                        
-                        for attr in e.attributes().with_checks(false) {
-                            if let Ok(attr) = attr {
-                                let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                                let value = std::str::from_utf8(&attr.value).unwrap_or("");
-                                
-                                match key.as_ref() {
-                                    "HPOS" => hpos = value.parse().unwrap_or(0.0),
-                                    "VPOS" => vpos = value.parse().unwrap_or(0.0),
-                                    "WIDTH" => width = value.parse().unwrap_or(3.0),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        
-                        // Add space as an element
-                        elements.push(AltoElement::new(
-                            format!("space_{}", element_id),
-                            " ".to_owned(),
-                            hpos,
-                            vpos,
-                            width,
-                            height,
-                        ));
-                        element_id += 1;
+                Ok(XmlEvent::Start(e)) | Ok(XmlEvent::Empty(e)) => {
+                    if let Some(element) = self.parse_element(&e) {
+                        elements.push(element);
                     }
                 }
-                Ok(Event::Eof) => break,
+                Ok(XmlEvent::Eof) => break,
                 _ => {}
             }
             buf.clear();
         }
         
         elements
+    }
+    
+    fn parse_element(&self, e: &BytesStart) -> Option<AltoElement> {
+        let attrs: HashMap<String, String> = e.attributes()
+            .filter_map(Result::ok)
+            .map(|a| {
+                (
+                    String::from_utf8_lossy(a.key.as_ref()).to_string(),
+                    String::from_utf8_lossy(&a.value).to_string()
+                )
+            })
+            .collect();
+        
+        match e.name().as_ref() {
+            b"String" => {
+                let content = attrs.get("CONTENT").cloned().unwrap_or_default();
+                if !content.is_empty() {
+                    Some(AltoElement::from_attrs(attrs, ElementType::Text))
+                } else {
+                    None
+                }
+            }
+            b"SP" => Some(AltoElement::from_attrs(attrs, ElementType::Space)),
+            _ => None
+        }
     }
     
     fn render(&self) -> Result<()> {
@@ -548,7 +747,7 @@ impl WysiwygEditor {
         
         // Minimal clearing to reduce flashing
         if !self.ab_mode {
-            execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+            TerminalRenderer::new().clear_screen().render();
         }
         // In A-B mode, don't clear at all - just update what's needed
         
@@ -558,11 +757,8 @@ impl WysiwygEditor {
             self.render_text_only()?;
         }
         
-        // Status line with layout mode and pane info
-        let mode_indicator = match self.layout_mode {
-            LayoutMode::Spatial => "SPATIAL",
-            LayoutMode::Sequential => "FLOW",
-        };
+        // Status line - always FLOW mode now
+        let mode_indicator = "FLOW";
         
         let pane_indicator = if self.ab_mode {
             match self.active_pane {
@@ -573,7 +769,7 @@ impl WysiwygEditor {
             ""
         };
         
-        let scroll_info = if !self.ab_mode && self.layout_mode == LayoutMode::Sequential {
+        let scroll_info = if !self.ab_mode {
             let total_lines = self.text_buffer.lines().count();
             let visible_lines = (self.terminal_height - 1) as usize;
             if total_lines > visible_lines {
@@ -585,7 +781,7 @@ impl WysiwygEditor {
             String::new()
         };
         
-        let status_text = format!("{} - Page {}/{} - {}% - {} (Ctrl+L){}{}", 
+        let status_text = format!("{} - Page {}/{} - {}% - {}{}{}", 
             self.pdf_path.file_stem().unwrap_or_default().to_string_lossy(),
             self.current_page,
             self.total_pages,
@@ -594,40 +790,31 @@ impl WysiwygEditor {
             pane_indicator,
             scroll_info);
         
-        execute!(
-            io::stdout(),
-            cursor::MoveTo(0, self.terminal_height - 1),
-            SetForegroundColor(Color::DarkGrey),
-            Print(status_text),
-            ResetColor
-        )?;
+        // Use builder pattern for cleaner rendering
+        let mut renderer = TerminalRenderer::new()
+            .draw_status_line(self.terminal_height - 1, &status_text);
         
         // Position cursor only in text mode
         if !self.ab_mode {
-            execute!(
-                io::stdout(),
-                cursor::MoveTo(self.cursor_x, self.cursor_y),
-                cursor::Show
-            )?;
+            renderer = renderer
+                .move_cursor(self.cursor_x, self.cursor_y)
+                .show_cursor();
         } else {
-            // Hide cursor completely in A-B mode
-            execute!(io::stdout(), cursor::Hide)?;
+            renderer = renderer.hide_cursor();
         }
         
-        io::stdout().flush()?;
+        renderer.render();
         Ok(())
     }
     
     fn render_text_only(&self) -> Result<()> {
-        // Display the text buffer as continuous text (full width)
         // Calculate how many lines we can show (leave room for status line)
         let available_lines = (self.terminal_height - 1) as usize;
         let total_lines: Vec<&str> = self.text_buffer.lines().collect();
         
-        // Clear the text area
-        for y in 0..available_lines {
-            execute!(io::stdout(), cursor::MoveTo(0, y as u16), Print(" ".repeat(self.terminal_width as usize)))?;
-        }
+        // Clear text area using builder pattern
+        let mut renderer = TerminalRenderer::new()
+            .clear_area(0, 0, self.terminal_width as usize, available_lines);
         
         // Render visible lines starting from scroll_offset
         for (screen_line, text_line_index) in (self.scroll_offset..).enumerate() {
@@ -636,10 +823,13 @@ impl WysiwygEditor {
             }
             
             if let Some(line) = total_lines.get(text_line_index) {
+                // For now, use direct rendering for selection - will improve this later
                 execute!(io::stdout(), cursor::MoveTo(0, screen_line as u16))?;
                 self.render_line_with_selection(line, screen_line as u16, 0)?;
             }
         }
+        
+        renderer.render();
         Ok(())
     }
     
@@ -648,21 +838,11 @@ impl WysiwygEditor {
         
         // Left side: PDF image area 
         if !self.pdf_image_rendered {
-            execute!(
-                io::stdout(),
-                cursor::MoveTo(2, 2),
-                SetForegroundColor(Color::Cyan),
-                Print("Loading PDF image..."),
-                ResetColor,
-                cursor::MoveTo(2, 4),
-                SetForegroundColor(Color::Yellow),
-                Print(format!("Page: {}", self.current_page)),
-                ResetColor,
-                cursor::MoveTo(2, 5),
-                SetForegroundColor(Color::Yellow),
-                Print(format!("File: {}", self.pdf_path.display())),
-                ResetColor
-            )?;
+            TerminalRenderer::new()
+                .draw_text(2, 2, "Loading PDF image...", Color::Cyan)
+                .draw_text(2, 4, &format!("Page: {}", self.current_page), Color::Yellow)
+                .draw_text(2, 5, &format!("File: {}", self.pdf_path.display()), Color::Yellow)
+                .render();
         } else {
             // Don't overwrite the image area - it should be displayed
             // The image is rendered at position 0,0 and takes up the left panel
@@ -670,32 +850,24 @@ impl WysiwygEditor {
         }
         
         // Clean vertical separator with subtle focus indication
+        let separator_color = match self.active_pane {
+            ActivePane::Image => Color::Blue,    // Subtle blue for image focus
+            ActivePane::Text => Color::DarkGrey, // Muted for text focus
+        };
+        
+        let mut renderer = TerminalRenderer::new();
         for y in 0..(self.terminal_height - 1) {
-            let separator_color = match self.active_pane {
-                ActivePane::Image => Color::Blue,    // Subtle blue for image focus
-                ActivePane::Text => Color::DarkGrey, // Muted for text focus
-            };
-            
-            execute!(
-                io::stdout(),
-                cursor::MoveTo(split_x, y),
-                SetForegroundColor(separator_color),
-                Print("│"),
-                ResetColor
-            )?;
+            renderer = renderer.draw_text(split_x, y, "│", separator_color);
         }
+        renderer.render();
         
         // Right side: Text extraction with clean black background
         let right_panel_width = (self.terminal_width - split_x - 1) as usize;
         
-        // Clear right panel with black background
-        for y in 0..(self.terminal_height - 1) {
-            execute!(
-                io::stdout(),
-                cursor::MoveTo(split_x + 1, y),
-                Print(" ".repeat(right_panel_width))
-            )?;
-        }
+        // Clear right panel using builder pattern
+        TerminalRenderer::new()
+            .clear_area(split_x + 1, 0, right_panel_width, (self.terminal_height - 1) as usize)
+            .render();
         
         // Render text on clean background
         for (i, line) in self.text_buffer.lines().enumerate() {
@@ -714,69 +886,39 @@ impl WysiwygEditor {
     }
     
     fn render_line_with_selection(&self, line: &str, row: u16, col_offset: u16) -> Result<()> {
-        if !self.is_selecting {
+        if !self.selection.active {
             // No selection, just print normally
             execute!(io::stdout(), Print(line))?;
             return Ok(());
         }
         
+        // Check if this row is within selection using simplified logic
+        let ((min_x, min_y), (max_x, max_y)) = self.selection.normalized();
         
-        // Calculate selection bounds
-        let sel_start_x = self.selection_start_x.saturating_sub(col_offset);
-        let sel_start_y = self.selection_start_y;
-        let sel_end_x = self.selection_end_x.saturating_sub(col_offset);
-        let sel_end_y = self.selection_end_y;
-        
-        // Normalize selection bounds (ensure start <= end)
-        let (norm_start_y, norm_end_y) = if sel_start_y <= sel_end_y {
-            (sel_start_y, sel_end_y)
-        } else {
-            (sel_end_y, sel_start_y)
-        };
-        
-        let (norm_start_x, norm_end_x) = if sel_start_x <= sel_end_x {
-            (sel_start_x, sel_end_x)
-        } else {
-            (sel_end_x, sel_start_x)
-        };
-        
-        // Check if this row is within selection
-        if row >= norm_start_y && row <= norm_end_y {
+        if row >= min_y && row <= max_y {
+            let adj_min_x = min_x.saturating_sub(col_offset);
+            let adj_max_x = max_x.saturating_sub(col_offset);
+            
             let line_chars: Vec<char> = line.chars().collect();
-            let selection_width = (norm_end_x - norm_start_x + 1) as usize;
             
-            // Build the entire line in memory to reduce flicker
-            let mut rendered_line = String::new();
+            // Build the line parts
+            let pre_selection = if adj_min_x > 0 {
+                line_chars.iter().take(adj_min_x as usize).collect::<String>()
+            } else {
+                String::new()
+            };
             
-            // Add pre-selection content
-            for i in 0..norm_start_x as usize {
-                if i < line_chars.len() {
-                    rendered_line.push(line_chars[i]);
-                } else {
-                    rendered_line.push(' ');
-                }
-            }
-            
-            
-            // Add selection content (will be styled separately)
-            let mut selection_content = String::new();
-            for i in 0..selection_width {
-                let char_index = norm_start_x as usize + i;
-                if char_index < line_chars.len() {
-                    selection_content.push(line_chars[char_index]);
-                } else {
-                    selection_content.push(' ');
-                }
-            }
-            
-            // Add post-selection content
-            let mut post_selection = String::new();
-            for i in (norm_end_x + 1) as usize..line_chars.len() {
-                post_selection.push(line_chars[i]);
-            }
+            let selection_content = line_chars.iter()
+                .skip(adj_min_x as usize)
+                .take((adj_max_x - adj_min_x + 1) as usize)
+                .collect::<String>();
+                
+            let post_selection = line_chars.iter()
+                .skip((adj_max_x + 1) as usize)
+                .collect::<String>();
             
             // Render in one go to reduce flicker
-            execute!(io::stdout(), Print(&rendered_line))?;
+            execute!(io::stdout(), Print(&pre_selection))?;
             execute!(io::stdout(), SetBackgroundColor(Color::Blue), SetForegroundColor(Color::White), Print(&selection_content), ResetColor)?;
             execute!(io::stdout(), Print(&post_selection))?;
         } else {
@@ -967,18 +1109,14 @@ impl WysiwygEditor {
     fn handle_mouse_click(&mut self, x: u16, y: u16) -> Result<()> {
         // Allow cursor to go anywhere, even beyond viewport
         if y < self.terminal_height - 1 { // Only avoid status line
-            if !self.is_selecting {
+            if !self.selection.active {
                 // Start new selection
-                self.selection_start_x = x;
-                self.selection_start_y = y;
-                self.selection_end_x = x;
-                self.selection_end_y = y;
-                self.is_selecting = true;
+                self.selection.start_at(x, y);
                 self.cursor_x = x;
                 self.cursor_y = y;
             } else {
                 // Click again - clear selection
-                self.is_selecting = false;
+                self.selection.clear();
                 self.cursor_x = x;
                 self.cursor_y = y;
             }
@@ -988,23 +1126,12 @@ impl WysiwygEditor {
     }
     
     fn handle_mouse_drag(&mut self, x: u16, y: u16) -> Result<()> {
-        if y < self.terminal_height - 1 && self.is_selecting {
+        if y < self.terminal_height - 1 && self.selection.active {
             // Update selection end point during drag
-            self.selection_end_x = x;
-            self.selection_end_y = y;
+            self.selection.extend_to(x, y);
             
             // Position cursor at the bottom-right corner of selection
-            let max_x = if self.selection_start_x <= self.selection_end_x {
-                self.selection_end_x
-            } else {
-                self.selection_start_x
-            };
-            let max_y = if self.selection_start_y <= self.selection_end_y {
-                self.selection_end_y
-            } else {
-                self.selection_start_y
-            };
-            
+            let ((_, _), (max_x, max_y)) = self.selection.normalized();
             self.cursor_x = max_x;
             self.cursor_y = max_y;
         }
@@ -1017,121 +1144,49 @@ impl WysiwygEditor {
             return self.handle_file_picker_input(key, modifiers);
         }
         
-        // Debug EVERY key press to see what's happening
-        eprintln!("=== KEY PRESS ===");
-        eprintln!("Key: {:?}", key);
-        eprintln!("Modifiers: {:?}", modifiers);
-        eprintln!("AB mode: {}, Active pane: {:?}", self.ab_mode, self.active_pane);
-        eprintln!("Page: {}/{}", self.current_page, self.total_pages);
-        eprintln!("================");
+        // Debug key presses
+        eprintln!("Key: {:?}, Modifiers: {:?}, Page: {}/{}", key, modifiers, self.current_page, self.total_pages);
         
-        match key {
-            // Pane switching
-            KeyCode::Tab => {
-                if self.ab_mode {
-                    self.active_pane = match self.active_pane {
-                        ActivePane::Image => ActivePane::Text,
-                        ActivePane::Text => ActivePane::Image,
-                    };
-                }
+        // Handle commands with clean pattern matching
+        match (key, modifiers) {
+            // Global commands - quit with q, Q, or Ctrl+Q
+            (KeyCode::Char('q'), KeyModifiers::NONE) | 
+            (KeyCode::Char('Q'), KeyModifiers::NONE) |
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) |
+            (KeyCode::Char('Q'), KeyModifiers::CONTROL) => {
+                return Ok(true);
             }
             
-            // Image pane controls (only when image pane is active)
-            KeyCode::Char('=') | KeyCode::Char('+') if self.ab_mode && self.active_pane == ActivePane::Image => {
-                // Log zoom attempt
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/chonker95_debug.log")
-                    .and_then(|mut file| {
-                        use std::io::Write;
-                        writeln!(file, "ZOOM IN: {} -> {}", self.zoom_level, 
-                            match self.zoom_level { 100 => 150, 150 => 200, 200 => 300, 300 => 400, 400 => 600, _ => self.zoom_level + 100 })
-                    });
-                self.zoom_in()?;
-            }
-            KeyCode::Char('-') | KeyCode::Char('_') if self.ab_mode && self.active_pane == ActivePane::Image => {
-                // Log zoom attempt
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/chonker95_debug.log")
-                    .and_then(|mut file| {
-                        use std::io::Write;
-                        writeln!(file, "ZOOM OUT: {} -> {}", self.zoom_level,
-                            match self.zoom_level { 600 => 400, 400 => 300, 300 => 200, 200 => 150, 150 => 100, _ => if self.zoom_level > 100 { self.zoom_level - 100 } else { 100 } })
-                    });
-                self.zoom_out()?;
-            }
-            KeyCode::Char('0') if self.ab_mode && self.active_pane == ActivePane::Image => {
-                // Log reset attempt
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/chonker95_debug.log")
-                    .and_then(|mut file| {
-                        use std::io::Write;
-                        writeln!(file, "ZOOM RESET: {} -> 100", self.zoom_level)
-                    });
-                self.reset_zoom()?;
+            // File operations
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                self.open_file_picker()?;
+                return Ok(false);
             }
             
-            // Arrow key panning (only when in Image pane)
-            KeyCode::Up if self.ab_mode && self.active_pane == ActivePane::Image => {
-                self.pan_offset_y -= 5; // Fast movement
-                self.pdf_image_rendered = false; // Force re-render with new position
-                if self.ab_mode {
-                    self.render_pdf_image()?;
-                }
-            }
-            KeyCode::Down if self.ab_mode && self.active_pane == ActivePane::Image => {
-                self.pan_offset_y += 5; // Fast movement
-                self.pdf_image_rendered = false;
-                if self.ab_mode {
-                    self.render_pdf_image()?;
-                }
-            }
-            KeyCode::Left if self.ab_mode && self.active_pane == ActivePane::Image => {
-                self.pan_offset_x -= 5; // Fast movement
-                self.pdf_image_rendered = false;
-                if self.ab_mode {
-                    self.render_pdf_image()?;
-                }
-            }
-            KeyCode::Right if self.ab_mode && self.active_pane == ActivePane::Image => {
-                self.pan_offset_x += 5; // Fast movement
-                self.pdf_image_rendered = false;
-                if self.ab_mode {
-                    self.render_pdf_image()?;
-                }
-            }
-            
-            // Global controls (always available)
-            KeyCode::Char('a') | KeyCode::Char('A') if modifiers.contains(KeyModifiers::CONTROL) => {
+            // Mode operations
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
                 self.ab_mode = !self.ab_mode;
-                self.is_selecting = false; // Clear selection when switching modes
+                self.is_selecting = false;
                 if self.ab_mode {
-                    self.pdf_image_rendered = false; // Force re-render for A-B mode
-                    self.active_pane = ActivePane::Image; // Start with image focused in A-B mode
+                    self.pdf_image_rendered = false;
+                    self.active_pane = ActivePane::Image;
                 } else {
-                    // Clear screen when exiting A-B mode
                     execute!(io::stdout(), Clear(ClearType::All))?;
-                    self.active_pane = ActivePane::Text; // Back to text mode
+                    self.active_pane = ActivePane::Text;
                 }
+                return Ok(false);
             }
-            KeyCode::Char('d') | KeyCode::Char('D') if modifiers.contains(KeyModifiers::CONTROL) => {
+            
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.dark_mode = !self.dark_mode;
                 if self.ab_mode {
-                    self.pdf_image_rendered = false; // Force re-render with new theme
+                    self.pdf_image_rendered = false;
                 }
+                return Ok(false);
             }
-            KeyCode::Char('f') | KeyCode::Char('F') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_file_picker()?;
-            }
-            KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
             
-            // Global page navigation (works in any mode/pane)
-            KeyCode::Char(';') if modifiers.contains(KeyModifiers::CONTROL) => {
+            // Page navigation
+            (KeyCode::Char(';'), KeyModifiers::CONTROL) => {
                 eprintln!("CTRL+; pressed - Previous page attempt, current: {}, total: {}", self.current_page, self.total_pages);
                 if self.current_page > 1 {
                     self.current_page -= 1;
@@ -1141,8 +1196,10 @@ impl WysiwygEditor {
                     }
                     eprintln!("SUCCESS: Changed to page {}", self.current_page);
                 }
+                return Ok(false);
             }
-            KeyCode::Char('\'') if modifiers.contains(KeyModifiers::CONTROL) => {
+            
+            (KeyCode::Char('\''), KeyModifiers::CONTROL) => {
                 eprintln!("CTRL+' pressed - Next page attempt, current: {}, total: {}", self.current_page, self.total_pages);
                 if self.current_page < self.total_pages {
                     self.current_page += 1;
@@ -1152,14 +1209,104 @@ impl WysiwygEditor {
                     }
                     eprintln!("SUCCESS: Changed to page {}", self.current_page);
                 }
+                return Ok(false);
             }
             
-            // Text pane controls (only when text pane is active OR not in A-B mode)
-            _ if !self.ab_mode || self.active_pane == ActivePane::Text => {
-                self.handle_text_input(key, modifiers)?;
+            // Selection and editing
+            (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
+                self.apply_spatial_to_selection()?;
+                return Ok(false);
             }
             
-            _ => {} // Ignore other keys when in wrong pane
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if self.selection.active {
+                    self.copy_selection()?;
+                }
+                return Ok(false);
+            }
+            
+            (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
+                if self.selection.active {
+                    self.cut_selection()?;
+                }
+                return Ok(false);
+            }
+            
+            (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
+                self.paste_clipboard()?;
+                return Ok(false);
+            }
+            
+            (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+                self.undo()?;
+                return Ok(false);
+            }
+            
+            (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+                self.redo()?;
+                return Ok(false);
+            }
+            
+            // Pane switching
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                if self.ab_mode {
+                    self.active_pane = match self.active_pane {
+                        ActivePane::Image => ActivePane::Text,
+                        ActivePane::Text => ActivePane::Image,
+                    };
+                }
+                return Ok(false);
+            }
+            
+            _ => {} // Fall through to other handlers
+        }
+        
+        // Handle image pane controls (when image pane is active)
+        if self.ab_mode && self.active_pane == ActivePane::Image {
+            match key {
+                KeyCode::Char('=') | KeyCode::Char('+') => {
+                    self.zoom_in()?;
+                    return Ok(false);
+                }
+                KeyCode::Char('-') | KeyCode::Char('_') => {
+                    self.zoom_out()?;
+                    return Ok(false);
+                }
+                KeyCode::Char('0') => {
+                    self.reset_zoom()?;
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    self.pan_offset_y -= 5;
+                    self.pdf_image_rendered = false;
+                    self.render_pdf_image()?;
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    self.pan_offset_y += 5;
+                    self.pdf_image_rendered = false;
+                    self.render_pdf_image()?;
+                    return Ok(false);
+                }
+                KeyCode::Left => {
+                    self.pan_offset_x -= 5;
+                    self.pdf_image_rendered = false;
+                    self.render_pdf_image()?;
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    self.pan_offset_x += 5;
+                    self.pdf_image_rendered = false;
+                    self.render_pdf_image()?;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        
+        // Handle text input (when text pane is active OR not in A-B mode)
+        if !self.ab_mode || self.active_pane == ActivePane::Text {
+            self.handle_text_input(key, modifiers)?;
         }
         
         Ok(false)
@@ -1171,11 +1318,12 @@ impl WysiwygEditor {
             KeyCode::Up => {
                 if modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+Arrow: Extend block selection
-                    if !self.is_selecting {
+                    if !self.selection.active {
                         self.start_block_selection();
                     }
-                    if self.selection_end_y > 0 {
-                        self.selection_end_y -= 1;
+                    let (_, current_y) = self.selection.end;
+                    if current_y > 0 {
+                        self.selection.extend_to(self.selection.end.0, current_y - 1);
                     }
                     self.update_cursor_to_selection_corner();
                 } else if self.cursor_y > 0 {
@@ -1185,29 +1333,25 @@ impl WysiwygEditor {
             KeyCode::Down => {
                 if modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+Arrow: Extend block selection
-                    if !self.is_selecting {
+                    if !self.selection.active {
                         self.start_block_selection();
                     }
-                    self.selection_end_y += 1;
+                    let (current_x, current_y) = self.selection.end;
+                    self.selection.extend_to(current_x, current_y + 1);
                     self.update_cursor_to_selection_corner();
                 } else {
                     self.cursor_y += 1; // No bottom limit - can go beyond viewport
                 }
             }
             KeyCode::Left => {
-                if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::SHIFT) {
-                    // Ctrl+Left: Previous page
-                    if self.current_page > 1 {
-                        self.current_page -= 1;
-                        self.load_page()?;
-                    }
-                } else if modifiers.contains(KeyModifiers::SHIFT) {
+                if modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+Arrow: Extend block selection
-                    if !self.is_selecting {
+                    if !self.selection.active {
                         self.start_block_selection();
                     }
-                    if self.selection_end_x > 0 {
-                        self.selection_end_x -= 1;
+                    let (current_x, current_y) = self.selection.end;
+                    if current_x > 0 {
+                        self.selection.extend_to(current_x - 1, current_y);
                     }
                     self.update_cursor_to_selection_corner();
                 } else if self.cursor_x > 0 {
@@ -1215,18 +1359,13 @@ impl WysiwygEditor {
                 }
             }
             KeyCode::Right => {
-                if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::SHIFT) {
-                    // Ctrl+Right: Next page
-                    if self.current_page < self.total_pages {
-                        self.current_page += 1;
-                        self.load_page()?;
-                    }
-                } else if modifiers.contains(KeyModifiers::SHIFT) {
+                if modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+Arrow: Extend block selection
-                    if !self.is_selecting {
+                    if !self.selection.active {
                         self.start_block_selection();
                     }
-                    self.selection_end_x += 1;
+                    let (current_x, current_y) = self.selection.end;
+                    self.selection.extend_to(current_x + 1, current_y);
                     self.update_cursor_to_selection_corner();
                 } else {
                     self.cursor_x += 1; // No right limit - can go beyond viewport
@@ -1258,31 +1397,9 @@ impl WysiwygEditor {
             
             // Text-specific controls
             KeyCode::Esc => {
-                if self.is_selecting {
-                    self.is_selecting = false; // Clear selection with Escape
+                if self.selection.active {
+                    self.selection.clear(); // Clear selection with Escape
                 }
-            }
-            KeyCode::Char('c') | KeyCode::Char('C') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.is_selecting {
-                    self.copy_selection()?;
-                }
-            }
-            KeyCode::Char('x') | KeyCode::Char('X') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.is_selecting {
-                    self.cut_selection()?;
-                }
-            }
-            KeyCode::Char('v') | KeyCode::Char('V') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.paste_clipboard()?;
-            }
-            KeyCode::Char('z') | KeyCode::Char('Z') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.undo()?;
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.redo()?;
-            }
-            KeyCode::Char('l') | KeyCode::Char('L') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.toggle_layout_mode()?;
             }
             KeyCode::PageUp => {
                 if !self.ab_mode {
@@ -1368,75 +1485,26 @@ impl WysiwygEditor {
     }
     
     fn start_block_selection(&mut self) {
-        self.selection_start_x = self.cursor_x;
-        self.selection_start_y = self.cursor_y;
-        self.selection_end_x = self.cursor_x;
-        self.selection_end_y = self.cursor_y;
-        self.is_selecting = true;
+        self.selection.start_at(self.cursor_x, self.cursor_y);
     }
     
     fn update_cursor_to_selection_corner(&mut self) {
-        if self.is_selecting {
+        if self.selection.active {
             // Position cursor at the bottom-right corner of selection
-            let max_x = if self.selection_start_x <= self.selection_end_x {
-                self.selection_end_x
-            } else {
-                self.selection_start_x
-            };
-            let max_y = if self.selection_start_y <= self.selection_end_y {
-                self.selection_end_y
-            } else {
-                self.selection_start_y
-            };
-            
+            let ((_, _), (max_x, max_y)) = self.selection.normalized();
             self.cursor_x = max_x;
             self.cursor_y = max_y;
         }
     }
     
     fn copy_selection(&mut self) -> Result<()> {
-        if !self.is_selecting {
+        if !self.selection.active {
             return Ok(());
         }
         
-        let lines: Vec<&str> = self.text_buffer.lines().collect();
-        
-        // Normalize selection bounds
-        let (start_y, end_y) = if self.selection_start_y <= self.selection_end_y {
-            (self.selection_start_y, self.selection_end_y)
-        } else {
-            (self.selection_end_y, self.selection_start_y)
-        };
-        
-        let (start_x, end_x) = if self.selection_start_x <= self.selection_end_x {
-            (self.selection_start_x, self.selection_end_x)
-        } else {
-            (self.selection_end_x, self.selection_start_x)
-        };
-        
-        // Extract the selected block of text
-        let mut clipboard_lines = Vec::new();
-        for y in start_y..=end_y {
-            if (y as usize) < lines.len() {
-                let line = lines[y as usize];
-                let line_chars: Vec<char> = line.chars().collect();
-                
-                let mut selected_part = String::new();
-                for x in start_x..=end_x {
-                    if (x as usize) < line_chars.len() {
-                        selected_part.push(line_chars[x as usize]);
-                    } else {
-                        selected_part.push(' '); // Fill spaces for rectangular selection
-                    }
-                }
-                clipboard_lines.push(selected_part.trim_end().to_string());
-            } else {
-                // Empty line in selection
-                clipboard_lines.push("".to_string());
-            }
-        }
-        
-        let clipboard_text = clipboard_lines.join("\n");
+        // Use the Selection struct's extract_text method
+        let clipboard_text = self.selection.extract_text(&self.text_buffer);
+        let clipboard_lines: Vec<String> = clipboard_text.lines().map(|s| s.to_string()).collect();
         
         // Copy to both internal and system clipboard
         self.clipboard = clipboard_lines;
@@ -1450,7 +1518,7 @@ impl WysiwygEditor {
     }
     
     fn cut_selection(&mut self) -> Result<()> {
-        if !self.is_selecting {
+        if !self.selection.active {
             return Ok(());
         }
         
@@ -1464,7 +1532,7 @@ impl WysiwygEditor {
     }
     
     fn delete_selection(&mut self) -> Result<()> {
-        if !self.is_selecting {
+        if !self.selection.active {
             return Ok(());
         }
         
@@ -1844,7 +1912,7 @@ impl WysiwygEditor {
         }
         
         // Clear any active selection
-        self.is_selecting = false;
+        self.selection.clear();
         
         Ok(())
     }
@@ -1871,7 +1939,7 @@ impl WysiwygEditor {
         }
         
         // Clear any active selection
-        self.is_selecting = false;
+        self.selection.clear();
         
         Ok(())
     }
