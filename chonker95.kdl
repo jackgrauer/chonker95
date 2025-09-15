@@ -1,0 +1,6 @@
+layout {
+    pane focus=true {
+        command "bash"
+        args "-c" "DYLD_LIBRARY_PATH=/Users/jack/chonker95/lib /Users/jack/chonker95/target/release/chonker95 \"$CHONKER_PDF\""
+    }
+}

@@ -5,6 +5,15 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.99"
+arboard = "3.0"  # System clipboard integration
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
+dirs = "5.0"  # Mac-correct directory locations
+image = "0.24"  # Image processing for PDF rendering
 pdfium-render = { version = "0.8", features = ["core_graphics"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"  # JSON serialization for session state
+tokio = { version = "1.0", features = ["net", "rt"] }  # Async networking for sync
+trash = "5.0"  # Mac-style trash instead of delete
+unicode-width = "0.1"  # Proper character width calculation
+viuer = "0.7"  # Terminal image display

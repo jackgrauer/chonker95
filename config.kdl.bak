@@ -1,0 +1,52 @@
+keybinds {
+    normal clear-defaults=true {
+        bind "Ctrl a" { SwitchToMode "tmux"; }
+    }
+    tmux clear-defaults=true {
+        bind "Ctrl a" { Write 1; SwitchToMode "normal"; }
+        bind "\"" { NewPane "Down"; SwitchToMode "normal"; }
+        bind "%" { NewPane "Right"; SwitchToMode "normal"; }
+        bind "z" { ToggleFocusFullscreen; SwitchToMode "normal"; }
+        bind "c" { NewTab; SwitchToMode "normal"; }
+        bind "," { SwitchToMode "RenameTab"; }
+        bind "p" { GoToPreviousTab; SwitchToMode "normal"; }
+        bind "n" { GoToNextTab; SwitchToMode "normal"; }
+        bind "Left" { MoveFocus "Left"; SwitchToMode "normal"; }
+        bind "Right" { MoveFocus "Right"; SwitchToMode "normal"; }
+        bind "Down" { MoveFocus "Down"; SwitchToMode "normal"; }
+        bind "Up" { MoveFocus "Up"; SwitchToMode "normal"; }
+        bind "h" { MoveFocus "Left"; SwitchToMode "normal"; }
+        bind "l" { MoveFocus "Right"; SwitchToMode "normal"; }
+        bind "j" { MoveFocus "Down"; SwitchToMode "normal"; }
+        bind "k" { MoveFocus "Up"; SwitchToMode "normal"; }
+        bind "o" { FocusNextPane; }
+        bind "d" { Detach; }
+        bind "Space" { NextSwapLayout; }
+        bind "x" { CloseFocus; SwitchToMode "normal"; }
+    }
+}
+
+ui {
+    pane_frames {
+        rounded_corners false
+        hide_session_name true
+    }
+}
+
+themes {
+    chonker95 {
+        bg "#1e1e1e"
+        fg "#d4d4d4"
+        red "#f44747"
+        green "#608b4e"
+        blue "#569cd6"
+        yellow "#dcdcaa"
+        magenta "#c586c0"
+        orange "#ce9178"
+        cyan "#4ec9b0"
+        black "#1e1e1e"
+        white "#d4d4d4"
+    }
+}
+
+theme "chonker95"
