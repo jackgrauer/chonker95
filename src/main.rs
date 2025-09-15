@@ -7,6 +7,7 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
+use pdfium_render::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -137,79 +138,73 @@ impl WysiwygEditor {
     }
     
     fn extract_alto_elements(&self) -> Result<Vec<AltoElement>> {
-        let output = std::process::Command::new("pdfalto")
-            .args([
-                "-f", &self.current_page.to_string(),
-                "-l", &self.current_page.to_string(),
-                "-readingOrder", "-noImage", "-noLineNumbers",
-            ])
-            .arg(&self.pdf_path)
-            .arg("/dev/stdout")
-            .output()?;
-            
-        if !output.status.success() {
-            return Ok(vec![]);
-        }
-        
-        let xml_data = String::from_utf8_lossy(&output.stdout);
-        Ok(self.parse_alto_xml(&xml_data))
-    }
-    
-    fn parse_alto_xml(&self, xml: &str) -> Vec<AltoElement> {
-        use quick_xml::{Reader, events::Event};
-        
+        // Use pdfium's structured text extraction
+        let pdfium = Pdfium::default();
+        let document = pdfium.load_pdf_from_file(&self.pdf_path, None)?;
+        let page = document.pages().get((self.current_page - 1) as u16)?;
+        let text_page = page.text()?;
+
         let mut elements = Vec::new();
-        let mut reader = Reader::from_str(xml);
-        let mut buf = Vec::new();
-        let mut element_id = 0;
-        
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                    if e.name().as_ref() == b"String" {
-                        let mut content = String::new();
-                        let mut hpos = 0.0;
-                        let mut vpos = 0.0;
-                        let mut width = 0.0;
-                        let mut height = 10.0;
-                        
-                        for attr in e.attributes().with_checks(false) {
-                            if let Ok(attr) = attr {
-                                let key = String::from_utf8_lossy(attr.key.as_ref());
-                                let value = String::from_utf8_lossy(&attr.value);
-                                
-                                match key.as_ref() {
-                                    "CONTENT" => content = value.to_string(),
-                                    "HPOS" => hpos = value.parse().unwrap_or(0.0),
-                                    "VPOS" => vpos = value.parse().unwrap_or(0.0),
-                                    "WIDTH" => width = value.parse().unwrap_or(0.0),
-                                    "HEIGHT" => height = value.parse().unwrap_or(10.0),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        
-                        if !content.is_empty() {
-                            elements.push(AltoElement::new(
-                                format!("elem_{}", element_id),
-                                content,
-                                hpos,
-                                vpos,
-                                width,
-                                height,
-                            ));
-                            element_id += 1;
-                        }
+        let page_height = page.height().value;
+
+        // Use pdfium's text segments for better structure
+        for (segment_idx, segment) in text_page.segments().iter().enumerate() {
+            let segment_text = segment.text();
+            let bounds = segment.bounds();
+
+            // Convert PDF coordinates to our coordinate system
+            let x_coord = bounds.left().value;
+            let y_coord = page_height - bounds.bottom().value; // Flip Y axis
+
+            // Split segment into words but preserve spatial positioning
+            let mut word_offset = 0.0;
+            let avg_char_width = bounds.width().value / segment_text.len() as f32;
+
+            for word in segment_text.split_whitespace() {
+                if !word.is_empty() {
+                    elements.push(AltoElement::new(
+                        format!("seg_{}_{}", segment_idx, elements.len()),
+                        word.to_string(),
+                        x_coord + word_offset,
+                        y_coord,
+                        word.len() as f32 * avg_char_width,
+                        bounds.height().value,
+                    ));
+
+                    // Move to next word position within the segment
+                    word_offset += (word.len() + 1) as f32 * avg_char_width;
+                }
+            }
+        }
+
+        // If no segments found, fallback to simple text extraction
+        if elements.is_empty() {
+            let text_content = page.text()?.all();
+            let mut y_pos = 0.0;
+
+            for line in text_content.lines() {
+                let mut x_pos = 0.0;
+                for word in line.split_whitespace() {
+                    if !word.is_empty() {
+                        elements.push(AltoElement::new(
+                            format!("fallback_{}", elements.len()),
+                            word.to_string(),
+                            x_pos * 8.0,
+                            y_pos * 12.0,
+                            word.len() as f32 * 8.0,
+                            12.0,
+                        ));
+                        x_pos += word.len() as f32 + 1.0;
                     }
                 }
-                Ok(Event::Eof) => break,
-                _ => {}
+                y_pos += 1.0;
             }
-            buf.clear();
         }
-        
-        elements
+
+        Ok(elements)
     }
+
+    
     
     fn render(&self) -> Result<()> {
         execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
