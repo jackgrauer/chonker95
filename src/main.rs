@@ -345,30 +345,32 @@ impl WysiwygEditor {
 
     fn toggle_zellij_pane(&mut self) -> Result<()> {
         if Self::is_in_zellij() {
-            // Always try to create a new pane - if it fails, we're already split
-            let result = std::process::Command::new("zellij")
+            // Check if we have multiple panes by trying to focus another pane
+            let focus_result = std::process::Command::new("zellij")
                 .arg("action")
-                .arg("new-pane")
-                .arg("--direction")
+                .arg("move-focus")
                 .arg("left")
-                .arg("--")
-                .arg("/Users/jack/chonker95/viuer-pane.sh")
-                .arg(&self.pdf_path)
                 .output();
 
-            match result {
-                Ok(_) => {
-                    // Successfully created pane
-                    self.display_mode = DisplayMode::SplitScreen;
-                }
-                Err(_) => {
-                    // Failed to create pane, try to close instead
-                    std::process::Command::new("zellij")
-                        .arg("action")
-                        .arg("close-pane")
-                        .spawn()?;
-                    self.display_mode = DisplayMode::TextOnly;
-                }
+            if focus_result.is_ok() {
+                // We have multiple panes - close the one we just focused to
+                std::process::Command::new("zellij")
+                    .arg("action")
+                    .arg("close-pane")
+                    .spawn()?;
+                self.display_mode = DisplayMode::TextOnly;
+            } else {
+                // Only one pane - create new viuer pane
+                std::process::Command::new("zellij")
+                    .arg("action")
+                    .arg("new-pane")
+                    .arg("--direction")
+                    .arg("left")
+                    .arg("--")
+                    .arg("/Users/jack/chonker95/viuer-pane.sh")
+                    .arg(&self.pdf_path)
+                    .spawn()?;
+                self.display_mode = DisplayMode::SplitScreen;
             }
         }
         Ok(())
